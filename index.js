@@ -47,3 +47,11 @@ export {
   getConfigValue,
   debugConfig
 } from './lib/config-loader.js';
+
+// CSV Utilities
+export {
+  arrayToCsv,
+  csvToArray,
+  csvToObjects,
+  objectsToCsv
+} from './lib/csv-utils.js';
