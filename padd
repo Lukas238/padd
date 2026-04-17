@@ -13,6 +13,7 @@
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
+import { spawn } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,7 +22,7 @@ const __dirname = path.dirname(__filename);
 // Version & Help
 // ============================================================================
 
-const VERSION = '1.2.2';
+const VERSION = '1.2.3';
 
 function showVersion() {
   console.log(`padd v${VERSION}`);
@@ -193,9 +194,36 @@ async function main() {
     process.exit(1);
   }
 
-  // Try domain command discovery
+  // Try domain script execution
+  if (domainScripts && domainScripts.scripts) {
+    const scriptExists = domainScripts.scripts.find(s => s.name === command);
+    
+    if (scriptExists) {
+      console.log(`🔧 Running domain script: ${command}\n`);
+      
+      // Execute npm run from domain root using --prefix
+      // This finds package.json in domainScripts.dir but keeps current CWD
+      // So scripts can use process.cwd() for config discovery
+      const npmProcess = spawn('npm', ['run', '--prefix', domainScripts.dir, command, '--', ...subArgs], {
+        stdio: 'inherit',
+        shell: true
+      });
+      
+      npmProcess.on('close', (code) => {
+        process.exit(code || 0);
+      });
+      
+      return;
+    }
+  }
+
+  // Unknown command
   console.error(`\n❌ Unknown command: ${command}`);
-  console.error(`   Domain command discovery not yet implemented`);
+  if (domainScripts && domainScripts.scripts && domainScripts.scripts.length > 0) {
+    console.error(`\n   Available domain scripts:`);
+    domainScripts.scripts.forEach(s => console.error(`     padd ${s.name}`));
+  }
+
   console.error(`   Run: padd --help\n`);
   process.exit(1);
 }
