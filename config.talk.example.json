@@ -1,0 +1,26 @@
+{
+  "version": "1.0",
+  "domain": "talk",
+  
+  "talk": {
+    "series_name": "Wanna See Something Cool",
+    "series_abbreviation": "WSSC",
+    
+    "confluence": {
+      "space_key": "VMLDEVHUB",
+      "parent_page_id": "123456789",
+      "template": "talk_template.html"
+    },
+    
+    "sharepoint": {
+      "site_id": "yourcompany.sharepoint.com,abc123,def456",
+      "recordings_folder_id": "01ABCDEFGHIJK",
+      "naming_format": "{series_abbr}_S{season:02d}E{episode:02d}__{title}__{speaker}"
+    }
+  },
+  
+  "_meta": {
+    "description": "Configuration for talk domain",
+    "created_by": "padd config init talk"
+  }
+}

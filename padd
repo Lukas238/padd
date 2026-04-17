@@ -105,36 +105,71 @@ LEARN MORE
 async function main() {
   const args = process.argv.slice(2);
 
-  // Handle version/help flags
-  if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
-    showHelp();
-  }
-
+  // Handle version flag
   if (args.includes('--version') || args.includes('-v')) {
     showVersion();
   }
 
+  // Handle help flag (only if no command provided)
+  if (args.length === 0 || (args.includes('--help') && !args[0]) || (args.includes('-h') && !args[0])) {
+    showHelp();
+  }
+
   const command = args[0];
+  
+  // Handle main help for specific commands
+  if ((command === '--help' || command === '-h') && args.length === 1) {
+    showHelp();
+  }
+
+  const subArgs = args.slice(1);
 
   // Route to core commands
   if (command === 'auth') {
-    console.log('🔐 Auth commands coming soon...');
-    process.exit(0);
+    const { run } = await import('./commands/auth.js');
+    await run(subArgs);
+    return;
   }
 
   if (command === 'config') {
-    console.log('🔧 Config commands coming soon...');
-    process.exit(0);
+    const { run } = await import('./commands/config.js');
+    await run(subArgs);
+    return;
   }
 
   if (command === 'utils') {
-    console.log('🔨 Utility commands coming soon...');
-    process.exit(0);
+    const utilCommand = subArgs[0];
+    const utilArgs = subArgs.slice(1);
+
+    if (!utilCommand) {
+      console.error(`\n❌ Missing utility command`);
+      console.error(`   Available: confluence, sharepoint`);
+      console.error(`   Run: padd utils confluence --help\n`);
+      process.exit(1);
+    }
+
+    if (utilCommand === 'confluence') {
+      const { run } = await import('./commands/utils/confluence.js');
+      await run(utilArgs);
+      return;
+    }
+
+    if (utilCommand === 'sharepoint') {
+      const { run } = await import('./commands/utils/sharepoint.js');
+      await run(utilArgs);
+      return;
+    }
+
+    console.error(`\n❌ Unknown utility command: ${utilCommand}`);
+    console.error(`   Available: confluence, sharepoint`);
+    console.error(`   Run: padd utils ${utilCommand} --help\n`);
+    process.exit(1);
   }
 
   // Try domain command discovery
-  console.log(`🔍 Domain command discovery coming soon...`);
-  console.log(`   Looking for: ${command}`);
+  console.error(`\n❌ Unknown command: ${command}`);
+  console.error(`   Domain command discovery not yet implemented`);
+  console.error(`   Run: padd --help\n`);
   process.exit(1);
 }
 
