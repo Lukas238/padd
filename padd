@@ -1,22 +1,12 @@
 #!/usr/bin/env node
 
 /**
- * padd - Personal Access Display Device
+ * padd - Personal Access Data Delivery
  *
- * Context-aware CLI framework for operational automation.
- * Automatically discovers and dispatches to domain-specific commands.
+ * Connection helpers + CLI utilities for data platforms.
+ * Automatically discovers domain scripts when run from a workspace.
  *
- * Architecture:
- * - Core commands: auth, config (global, always available)
- * - Utility commands: utils confluence, utils sharepoint (direct API access)
- * - Domain commands: Auto-discovered from workspace (e.g., talk, report)
- *
- * Usage:
- *   padd <command> [options]
- *   padd --help
- *   padd --version
- *
- * @version 1.0.0
+ * @version 1.2.0
  * @license MIT
  */
 
@@ -31,71 +21,79 @@ const __dirname = path.dirname(__filename);
 // Version & Help
 // ============================================================================
 
-const VERSION = '1.0.0';
+const VERSION = '1.2.0';
 
 function showVersion() {
   console.log(`padd v${VERSION}`);
-  console.log('Personal Access Display Device');
+  console.log('Personal Access Data Delivery');
   process.exit(0);
 }
 
-function showHelp() {
-  console.log(`
-┌────────────────────────────────────────────────────────────────────────────┐
-│                                                                            │
-│   ██████╗  █████╗ ██████╗ ██████╗                                        │
-│   ██╔══██╗██╔══██╗██╔══██╗██╔══██╗   Personal Access Display Device      │
-│   ██████╔╝███████║██║  ██║██║  ██║                                        │
-│   ██╔═══╝ ██╔══██║██║  ██║██║  ██║   Context-aware CLI framework         │
-│   ██║     ██║  ██║██████╔╝██████╔╝                                        │
-│   ╚═╝     ╚═╝  ╚═╝╚═════╝ ╚═════╝    v${VERSION}                          │
-│                                                                            │
-└────────────────────────────────────────────────────────────────────────────┘
-
-USAGE
-  padd <command> [options]
-
-CORE COMMANDS (available everywhere)
-  padd auth init              Initialize authentication
-  padd auth refresh <provider> Refresh credentials (ms-graph, confluence, aws, github)
-  padd config init            Initialize configuration
-  padd config validate        Validate current config
-
-UTILITY COMMANDS (direct API access)
-  padd utils confluence create-page --space KEY --title "Title"
-  padd utils sharepoint upload --file data.xlsx
-
-DOMAIN COMMANDS (context-specific)
-  Domain commands are auto-discovered based on your current location.
-  Navigate to a workspace with padd metadata to see available commands.
-
-  Example (from talks workspace):
-    padd talk video-archive --date 2026-04-17
-    padd talk publish-confluence --date 2026-04-17
-
-OPTIONS
-  --help, -h                  Show help
-  --version, -v               Show version
-
-EXAMPLES
-  # Refresh Microsoft Graph token
-  padd auth refresh ms-graph
-
-  # Check current configuration
-  padd config validate
-
-  # Create Confluence page (utility command)
-  padd utils confluence create-page --space VMLDEVHUB --title "My Page"
-
-  # Domain-specific command (from workspace)
-  cd ~/Work/my-project/talks/
-  padd talk publish-confluence --date 2026-04-17
-
-LEARN MORE
-  Documentation: https://github.com/ldasso/padd
-  Report issues: https://github.com/ldasso/padd/issues
-`);
+function showHelp(domainScripts = null) {
+  console.log(`\n📦 padd v${VERSION} - Personal Access Data Delivery`);
+  console.log(`Connection helpers + CLI utilities for data platforms\n`);
+  
+  console.log(`USAGE
+  padd <command> [options]\n`);
+  
+  console.log(`CORE COMMANDS
+  auth       Manage authentication (init, refresh)
+  config     Manage configuration (init, validate)\n`);
+  
+  if (domainScripts && domainScripts.length > 0) {
+    console.log(`DOMAIN SCRIPTS (${domainScripts.domain})
+${domainScripts.scripts.map(s => `  ${s.name.padEnd(18)} ${s.description}`).join('\n')}\n`);
+  }
+  
+  console.log(`LIBRARY MODULES
+  - SharePointClient     Excel/file operations, uploads
+  - ConfluenceClient     Page creation, updates
+  - csv-utils            CSV/array conversions
+  - refreshProvider      Auto-refresh auth tokens
+  - loadAuth             Find & load auth config\n`);
+  
+  console.log(`Run 'padd <command> --help' for command details`);
+  console.log(`Docs: https://github.com/Lukas238/padd\n`);
   process.exit(0);
+}
+
+// ============================================================================
+// Domain Scripts Discovery
+// ============================================================================
+
+function findDomainScripts() {
+  try {
+    // Walk up from CWD looking for package.json with domain field
+    let currentDir = process.cwd();
+    const root = path.parse(currentDir).root;
+    
+    while (currentDir !== root) {
+      const pkgPath = path.join(currentDir, 'package.json');
+      if (fs.existsSync(pkgPath)) {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+        
+        // Check if this package.json has a domain field
+        if (pkg.domain && pkg.scripts) {
+          const scripts = Object.entries(pkg.scripts || {})
+            .filter(([name]) => !name.startsWith('pre') && !name.startsWith('post'))
+            .map(([name, cmd]) => ({
+              name,
+              description: cmd.includes('scripts/') 
+                ? path.basename(cmd.split('scripts/')[1].split(/\s/)[0], '.js')
+                : 'Custom script'
+            }));
+          
+          return { domain: pkg.domain, scripts, dir: currentDir };
+        }
+      }
+      
+      currentDir = path.dirname(currentDir);
+    }
+  } catch (err) {
+    // Silently fail - no domain scripts found
+  }
+  
+  return null;
 }
 
 // ============================================================================
@@ -105,6 +103,9 @@ LEARN MORE
 async function main() {
   const args = process.argv.slice(2);
 
+  // Discover domain scripts first
+  const domainScripts = findDomainScripts();
+
   // Handle version flag
   if (args.includes('--version') || args.includes('-v')) {
     showVersion();
@@ -112,7 +113,7 @@ async function main() {
 
   // Handle help flag (only if no command provided)
   if (args.length === 0 || (args.includes('--help') && !args[0]) || (args.includes('-h') && !args[0])) {
-    showHelp();
+    showHelp(domainScripts);
   }
 
   const command = args[0];

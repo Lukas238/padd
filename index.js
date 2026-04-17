@@ -55,3 +55,10 @@ export {
   csvToObjects,
   objectsToCsv
 } from './lib/csv-utils.js';
+
+// Config Discovery
+export {
+  findDomainConfig,
+  findTalkConfig,
+  getRepoRoot
+} from './lib/config-discovery.js';
