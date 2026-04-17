@@ -1,0 +1,40 @@
+{
+  "name": "padd",
+  "version": "1.0.0",
+  "description": "Personal Access Display Device - Context-aware CLI for operational automation",
+  "type": "module",
+  "bin": {
+    "padd": "./padd"
+  },
+  "exports": {
+    ".": "./padd",
+    "./lib/*": "./lib/*"
+  },
+  "keywords": [
+    "cli",
+    "automation",
+    "operations",
+    "confluence",
+    "sharepoint",
+    "context-aware",
+    "workflow",
+    "productivity"
+  ],
+  "author": "Lucas Dasso <lucas.dasso@vml.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ldasso/padd.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ldasso/padd/issues"
+  },
+  "homepage": "https://github.com/ldasso/padd#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {}
+}
