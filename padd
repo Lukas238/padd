@@ -208,17 +208,22 @@ async function main() {
       // Parse command: "node scripts/feedback-pull.js" -> ["node", "scripts/feedback-pull.js"]
       const [cmd, ...cmdArgs] = scriptCommand.split(/\s+/);
       
-      // Resolve script path relative to domain root, but execute from current directory
+      // Resolve script path relative to domain root
+      // Important: We resolve to absolute path but don't change CWD
+      // This way process.cwd() inside the script = where user ran padd
       let resolvedCmd = cmd;
-      if (cmdArgs.length > 0 && !path.isAbsolute(cmdArgs[0])) {
-        // First arg is likely a path (e.g., scripts/feedback-pull.js)
-        cmdArgs[0] = path.resolve(domainScripts.dir, cmdArgs[0]);
-      }
+      const resolvedArgs = cmdArgs.map(arg => {
+        // If arg looks like a relative path, resolve it relative to domain root
+        if (!arg.startsWith('-') && !path.isAbsolute(arg)) {
+          return path.resolve(domainScripts.dir, arg);
+        }
+        return arg;
+      });
       
-      // Execute with current CWD maintained for config discovery
-      const scriptProcess = spawn(resolvedCmd, [...cmdArgs, ...subArgs], {
+      // Execute without shell to preserve CWD exactly
+      const scriptProcess = spawn(resolvedCmd, [...resolvedArgs, ...subArgs], {
         stdio: 'inherit',
-        shell: true
+        cwd: process.cwd() // Explicitly maintain current working directory
       });
       
       scriptProcess.on('close', (code) => {
