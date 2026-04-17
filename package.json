@@ -1,6 +1,6 @@
 {
   "name": "@lukas238/padd",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Personal Access Data Delivery - Connection helpers and utilities for operational automation",
   "type": "module",
   "bin": {
