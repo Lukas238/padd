@@ -69,12 +69,14 @@ padd talk publish-confluence --date 2026-04-17
 Import `padd` libraries in your custom scripts:
 
 ```javascript
-import { ConfluenceClient } from 'padd/lib/confluence-client.js';
-import { SharePointClient } from 'padd/lib/sharepoint-client.js';
-import { loadAuthFile } from 'padd/lib/auth-storage.js';
+// Convenient: import from main module
+import { ConfluenceClient, SharePointClient, loadAuth } from 'padd';
 
-// Your custom logic...
-const auth = loadAuthFile();
+// Or explicit: import from specific modules
+import { ConfluenceClient } from 'padd/lib/confluence-client.js';
+
+// Usage
+const { auth } = loadAuth();
 const client = new ConfluenceClient(auth.providers.confluence);
 ```
 

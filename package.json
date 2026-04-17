@@ -6,9 +6,10 @@
   "bin": {
     "padd": "./padd"
   },
+  "main": "./index.js",
   "exports": {
-    ".": "./padd",
-    "./lib/*": "./lib/*"
+    ".": "./index.js",
+    "./lib/*": "./lib/*.js"
   },
   "keywords": [
     "cli",
