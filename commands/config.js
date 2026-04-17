@@ -180,26 +180,33 @@ CONFIG FILE DISCOVERY
 }
 
 export async function run(args) {
-  const command = args[0];
+  // Parse flags first
   const options = {};
-
-  // Parse flags
-  if (args.includes('--force')) {
-    options.force = true;
+  const positionalArgs = [];
+  
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--force') {
+      options.force = true;
+    } else if (args[i] === '--full') {
+      options.full = true;
+    } else if (args[i] === '--help' || args[i] === '-h') {
+      showHelp();
+      process.exit(0);
+    } else if (!args[i].startsWith('--')) {
+      positionalArgs.push(args[i]);
+    }
   }
 
-  if (args.includes('--full')) {
-    options.full = true;
-  }
+  const command = positionalArgs[0];
 
-  if (!command || args.includes('--help') || args.includes('-h')) {
+  if (!command) {
     showHelp();
     process.exit(0);
   }
 
   switch (command) {
     case 'init':
-      const domain = args[1];
+      const domain = positionalArgs[1];
       await configInit(domain, options);
       break;
 
