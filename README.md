@@ -1,31 +1,35 @@
-# padd
+# @lukas238/padd
 
-**Personal Access Display Device** - Context-aware CLI for operational automation
+**Personal Access Data Delivery** - Connection helpers and utilities for operational automation
 
-> Inspired by Star Trek: The Next Generation's PADD devices - your personal interface for managing operations.
+> Inspired by Star Trek: The Next Generation's PADD devices - your personal toolkit for accessing data platforms.
 
 ## Quick Start
 
 ```bash
 # Install globally
-npm install -g padd
+npm install -g @lukas238/padd
+
+# Or install in your project
+npm install @lukas238/padd
 
 # Initialize authentication
 cd ~/Work/my-repo/
-padd init
+padd auth init
 
-# Use domain commands
-cd talks/my-series/
-padd talk video-archive --date 2026-04-17
+# Use in your scripts
+import { loadAuth, ConfluenceClient } from '@lukas238/padd';
+const { auth } = loadAuth();
+const confluence = new ConfluenceClient(auth.providers.confluence);
 ```
 
 ## Features
 
-- 🎯 **Context-Aware**: Automatically detects your location and available commands
-- 🔐 **Secure**: Built-in encryption support with git-crypt detection
-- 🔧 **Extensible**: Add custom domains and commands
-- 📚 **Well-Documented**: Comprehensive help at every level
-- ⚡ **Fast**: Minimal overhead, instant help commands
+- 🔌 **Connection Helpers**: Ready-to-use clients for Confluence and SharePoint
+- 🔐 **Secure Auth**: Built-in credential management with encryption support (git-crypt)
+- 🔧 **Importable Libraries**: Use just what you need in your scripts
+- 📦 **Batteries Included**: Auth refresh, config validation, utility functions
+- ⚡ **Minimal Dependencies**: Lightweight and fast
 
 ## Core Commands
 
@@ -45,35 +49,27 @@ padd utils confluence create-page --space KEY --title "Title"
 padd utils sharepoint upload --file data.xlsx
 ```
 
-### Domain Commands (context-specific)
+## What is PADD?
 
-Domain commands are discovered automatically based on your current location.
+`padd` is a collection of connection helpers and utilities:
 
-```bash
-cd talks/my-series/
-padd talk video-archive --date 2026-04-17
-padd talk publish-confluence --date 2026-04-17
-```
+- **Generic Libraries**: Reusable API clients (Confluence, SharePoint)
+- **Auth Management**: Secure credential storage and refresh logic
+- **Config Utilities**: Configuration loading and validation
+- **CLI Tools**: Optional command-line interface for auth/config operations
 
-## Architecture
-
-`padd` is designed as a CLI framework:
-
-- **Generic Libraries**: Reusable API clients (Confluence, SharePoint, etc.)
-- **Core Commands**: Authentication, configuration management
-- **Utility Commands**: Direct access to low-level operations
-- **Domain Discovery**: Automatically finds and loads domain-specific commands
+The libraries are the core product. The CLI provides convenient access to auth and config commands.
 
 ## Libraries
 
-Import `padd` libraries in your custom scripts:
+Import `@lukas238/padd` libraries in your custom scripts:
 
 ```javascript
 // Convenient: import from main module
-import { ConfluenceClient, SharePointClient, loadAuth } from 'padd';
+import { ConfluenceClient, SharePointClient, loadAuth } from '@lukas238/padd';
 
 // Or explicit: import from specific modules
-import { ConfluenceClient } from 'padd/lib/confluence-client.js';
+import { ConfluenceClient } from '@lukas238/padd/lib/confluence-client.js';
 
 // Usage
 const { auth } = loadAuth();
@@ -90,8 +86,7 @@ const client = new ConfluenceClient(auth.providers.confluence);
 ## Documentation
 
 - [Architecture](./ARCHITECTURE.md) - System design
-- [Security](./SECURITY.md) - Security considerations  
-- [Contributing](./CONTRIBUTING.md) - How to extend
+- [Security](./SECURITY.md) - Security considerations
 
 ## License
 

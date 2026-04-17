@@ -1,7 +1,7 @@
 {
-  "name": "padd",
+  "name": "@lukas238/padd",
   "version": "1.0.0",
-  "description": "Personal Access Display Device - Context-aware CLI for operational automation",
+  "description": "Personal Access Data Delivery - Connection helpers and utilities for operational automation",
   "type": "module",
   "bin": {
     "padd": "./padd"
@@ -21,16 +21,16 @@
     "workflow",
     "productivity"
   ],
-  "author": "Lucas Dasso <lucas.dasso@vml.com>",
+  "author": "Lucas Dasso - Developer",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ldasso/padd.git"
+    "url": "https://github.com/Lukas238/padd.git"
   },
   "bugs": {
-    "url": "https://github.com/ldasso/padd/issues"
+    "url": "https://github.com/Lukas238/padd/issues"
   },
-  "homepage": "https://github.com/ldasso/padd#readme",
+  "homepage": "https://github.com/Lukas238/padd#readme",
   "engines": {
     "node": ">=18.0.0"
   },
