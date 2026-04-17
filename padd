@@ -21,7 +21,7 @@ const __dirname = path.dirname(__filename);
 // Version & Help
 // ============================================================================
 
-const VERSION = '1.2.1';
+const VERSION = '1.2.2';
 
 function showVersion() {
   console.log(`padd v${VERSION}`);
@@ -42,7 +42,9 @@ function showHelp(domainScripts = null) {
   
   if (domainScripts && domainScripts.scripts && domainScripts.scripts.length > 0) {
     const domainPath = path.relative(process.cwd(), domainScripts.dir) || '.';
-    console.log(`DOMAIN SCRIPTS (${domainScripts.domain} @ ${domainPath})
+    const domainName = domainScripts.packageName || domainScripts.domain;
+    const pathInfo = domainPath === '.' ? '' : ` @ ${domainPath}`;
+    console.log(`DOMAIN SCRIPTS (${domainName}${pathInfo})
 ${domainScripts.scripts.map(s => `  npm run ${s.name.padEnd(20)} ${s.description}`).join('\n')}\n`);
   }
   
@@ -75,8 +77,21 @@ function findDomainScripts() {
         
         // Check if this package.json has a domain field
         if (pkg.domain && pkg.scripts) {
+          const allScriptNames = Object.keys(pkg.scripts);
           const scripts = Object.entries(pkg.scripts || {})
-            .filter(([name]) => !name.startsWith('pre') && !name.startsWith('post'))
+            .filter(([name]) => {
+              // Exclude npm lifecycle hooks like preinstall, postbuild
+              // But keep scripts like pre-talk, post-talk (they have hyphens)
+              if (name.startsWith('pre') || name.startsWith('post')) {
+                // If it has a hyphen, it's a regular script, keep it
+                if (name.includes('-')) return true;
+                // Check if it's a lifecycle hook for another script
+                const baseScript = name.startsWith('pre') ? name.slice(3) : name.slice(4);
+                // If the base script exists, it's a lifecycle hook, exclude it
+                return !allScriptNames.includes(baseScript);
+              }
+              return true;
+            })
             .map(([name, cmd]) => {
               // Extract meaningful description from command
               let description = '';
@@ -89,7 +104,12 @@ function findDomainScripts() {
               return { name, description };
             });
           
-          return { domain: pkg.domain, scripts, dir: currentDir };
+          return { 
+            domain: pkg.domain, 
+            packageName: pkg.name,
+            scripts, 
+            dir: currentDir 
+          };
         }
       }
       
