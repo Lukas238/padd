@@ -22,7 +22,7 @@ const __dirname = path.dirname(__filename);
 // Version & Help
 // ============================================================================
 
-const VERSION = '1.2.6';
+const VERSION = '1.2.7';
 
 function showVersion() {
   console.log(`padd v${VERSION}`);
@@ -222,11 +222,35 @@ async function main() {
       
       // Execute without shell to preserve CWD exactly
       const scriptProcess = spawn(resolvedCmd, [...resolvedArgs, ...subArgs], {
-        stdio: 'inherit',
+        stdio: ['inherit', 'inherit', 'pipe'], // Capture stderr to clean up error messages
         cwd: process.cwd() // Explicitly maintain current working directory
       });
       
+      let stderrOutput = '';
+      scriptProcess.stderr.on('data', (data) => {
+        stderrOutput += data.toString();
+      });
+      
       scriptProcess.on('close', (code) => {
+        if (code !== 0 && stderrOutput) {
+          // Extract just the error message, skip stack trace
+          const lines = stderrOutput.split('\n');
+          const errorLine = lines.findIndex(line => line.includes('Error:'));
+          
+          if (errorLine !== -1) {
+            // Find where the error message ends (before stack trace)
+            let endLine = errorLine + 1;
+            while (endLine < lines.length && lines[endLine] && !lines[endLine].trim().startsWith('at ')) {
+              endLine++;
+            }
+            
+            // Print only the error message part
+            console.error('\n' + lines.slice(errorLine, endLine).join('\n') + '\n');
+          } else {
+            // If we can't parse it, show everything
+            process.stderr.write(stderrOutput);
+          }
+        }
         process.exit(code || 0);
       });
       
