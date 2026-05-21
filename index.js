@@ -1,12 +1,12 @@
 /**
  * padd - Main Entry Point
- * 
+ *
  * Barrel export for convenient imports.
- * 
+ *
  * @example
  * // Import everything from the main module
  * import { ConfluenceClient, SharePointClient, loadAuth } from 'padd';
- * 
+ *
  * // Or import specific modules (still works)
  * import { ConfluenceClient } from 'padd/lib/confluence-client.js';
  */
@@ -55,6 +55,13 @@ export {
   csvToObjects,
   objectsToCsv
 } from './lib/csv-utils.js';
+
+// Confluence Converter
+export {
+  storageToMarkdown,
+  buildMarkHeaders,
+  slugifyTitle,
+} from './lib/confluence-converter.js';
 
 // Config Discovery
 export {

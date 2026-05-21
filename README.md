@@ -1,92 +1,147 @@
 # @lukas238/padd
 
-**Personal Access Data Delivery** - Connection helpers and utilities for operational automation
+**Personal Access Data Delivery** — CLI toolkit for syncing Markdown files with Confluence.
 
-> Inspired by Star Trek: The Next Generation's PADD devices - your personal toolkit for accessing data platforms.
+> Inspired by Star Trek: The Next Generation's PADD devices.
 
 ## Quick Start
 
 ```bash
-# Install globally
 npm install -g @lukas238/padd
 
-# Or install in your project
-npm install @lukas238/padd
-
-# Initialize authentication
-cd ~/Work/my-repo/
+# Authenticate
 padd auth init
 
-# Use in your scripts
-import { loadAuth, ConfluenceClient } from '@lukas238/padd';
-const { auth } = loadAuth();
-const confluence = new ConfluenceClient(auth.providers.confluence);
+# Initialize a Confluence space in a local folder
+cd ~/Work/my-repo/knowledge/MY-SPACE/
+padd confluence init MY-SPACE
+
+# Pull all pages
+padd confluence pull --all
+
+# Push a file
+padd confluence push home.md
 ```
 
-## Features
+## Commands
 
-- 🔌 **Connection Helpers**: Ready-to-use clients for Confluence and SharePoint
-- 🔐 **Secure Auth**: Built-in credential management with encryption support (git-crypt)
-- 🔧 **Importable Libraries**: Use just what you need in your scripts
-- 📦 **Batteries Included**: Auth refresh, config validation, utility functions
-- ⚡ **Minimal Dependencies**: Lightweight and fast
-
-## Core Commands
-
-### Global Commands (available everywhere)
+### Auth
 
 ```bash
-padd auth init              # Setup authentication
-padd auth refresh <provider> # Refresh credentials
-padd config init            # Initialize configuration
-padd config validate        # Validate current config
+padd auth init                    # Interactive credential setup
+padd auth refresh confluence      # Refresh Confluence token
 ```
 
-### Utility Commands (advanced)
+### Confluence Sync
 
 ```bash
-padd utils confluence create-page --space KEY --title "Title"
-padd utils sharepoint upload --file data.xlsx
+padd confluence init [SPACE]      # Create .confluence.yaml in current folder
+padd confluence pull [--all]      # Pull updated pages from Confluence
+padd confluence pull <page-id>    # Pull a specific page by ID
+padd confluence push <file|dir>   # Push one file or all files in a directory
+padd confluence push <file> --include-childs  # Push file + all child pages
+padd confluence sync              # Pull then push (two-way sync)
 ```
 
-## What is PADD?
+### Config
 
-`padd` is a collection of connection helpers and utilities:
+```bash
+padd config init                  # Initialize config file
+padd config validate              # Validate current config
+```
 
-- **Generic Libraries**: Reusable API clients (Confluence, SharePoint)
-- **Auth Management**: Secure credential storage and refresh logic
-- **Config Utilities**: Configuration loading and validation
-- **CLI Tools**: Optional command-line interface for auth/config operations
+## Confluence Sync
 
-The libraries are the core product. The CLI provides convenient access to auth and config commands.
+### `.confluence.yaml`
+
+Place this file at the root of your space folder:
+
+```yaml
+base_url: https://confluence.example.com
+token: YOUR-PAT
+space: MYSPACE
+root_page_id: 123456
+```
+
+### Page headers
+
+Every `.md` file must start with Confluence metadata headers:
+
+```markdown
+<!-- Space: MYSPACE -->
+<!-- Parent: Parent Page Title -->
+<!-- Title: My Page Title -->
+<!-- PageId: 123456 -->
+```
+
+### Folder structure
+
+Pages follow the hierarchy of the folder structure. A page `home.md` with children in `home/` maps to a Confluence parent/child tree:
+
+```
+home.md                     → Home
+home/who-we-are.md          → Home > Who We Are
+home/standards.md           → Home > Standards
+```
+
+### Same-space page links
+
+Use relative `.md` links to link between pages in the same space. They are automatically converted to `<ac:link>` macros on push:
+
+```markdown
+See [Our Standards](home/standards.md) for details.
+```
+
+If a page exists in Confluence but hasn't been pulled locally yet, pull produces a **disabled link** using strikethrough — it round-trips correctly on push:
+
+```markdown
+- [~~Our Standards~~]()
+```
+
+### Confluence macros (verbatim blocks)
+
+For macros that have no Markdown equivalent, wrap the raw Confluence XML in a verbatim block. The XML is preserved through pull→edit→push round-trips:
+
+```markdown
+<!--[CONFLUENCE]
+<ac:structured-macro ac:name="recently-updated" ac:schema-version="1" ac:macro-id="...">
+  <ac:parameter ac:name="max">5</ac:parameter>
+</ac:structured-macro>
+-->
+`confluence-macro: recently-updated`
+<!--[/CONFLUENCE]-->
+```
+
+The second form (without the closing `<!--[/CONFLUENCE]-->`) is for verbatim-only blocks with no Markdown fallback.
+
+**Two-phase push**: `mark` (the Markdown→Confluence converter) never sees the raw XML. PADD extracts verbatim blocks before calling mark, then restores them via the API after mark pushes the page.
+
+### Macro conversion on pull
+
+| Macro | Markdown output |
+|---|---|
+| `code` | ` ```lang ... ``` ` |
+| `info`, `note`, `tip`, `warning` | `> blockquote` |
+| `expand` / `details` | inline content |
+| `mermaid` | ` ```mermaid ... ``` ` |
+| `toc` | `<!-- Table of Contents -->` |
+| `children` | `<!-- Child Pages -->` |
+| unknown / navigation macros | `` `confluence-macro: name` `` |
 
 ## Libraries
 
-Import `@lukas238/padd` libraries in your custom scripts:
-
 ```javascript
-// Convenient: import from main module
-import { ConfluenceClient, SharePointClient, loadAuth } from '@lukas238/padd';
+import { ConfluenceClient, loadAuth } from '@lukas238/padd';
 
-// Or explicit: import from specific modules
-import { ConfluenceClient } from '@lukas238/padd/lib/confluence-client.js';
-
-// Usage
 const { auth } = loadAuth();
 const client = new ConfluenceClient(auth.providers.confluence);
 ```
 
 ## Security
 
-- Auth files use `.enc.` suffix (`auth.enc.json`)
-- Auto chmod 600 on sensitive files
-- git-crypt detection and warnings
-- Conditional .gitignore management
-
-## Documentation
-
-- [Architecture](./ARCHITECTURE.md) - System design
-- [Security](./SECURITY.md) - Security considerations
+- Auth files use `.enc.` suffix (`auth.enc.json`) — excluded from git or encrypted via git-crypt
+- Sensitive files auto-chmod to 600
+- See [SECURITY.md](./SECURITY.md)
 
 ## License
 

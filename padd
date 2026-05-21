@@ -33,14 +33,15 @@ function showVersion() {
 function showHelp(domainScripts = null) {
   console.log(`\n📦 padd v${VERSION} - Personal Access Data Delivery`);
   console.log(`Connection helpers + CLI utilities for data platforms\n`);
-  
+
   console.log(`USAGE
   padd <command> [options]\n`);
-  
+
   console.log(`CORE COMMANDS
-  auth       Manage authentication (init, refresh)
-  config     Manage configuration (init, validate)\n`);
-  
+  auth            Manage authentication (init, refresh)
+  config          Manage configuration (init, validate)
+  confluence      Pull/push/sync Confluence pages\n`);
+
   if (domainScripts && domainScripts.scripts && domainScripts.scripts.length > 0) {
     const domainPath = path.relative(process.cwd(), domainScripts.dir) || '.';
     const domainName = domainScripts.packageName || domainScripts.domain;
@@ -48,14 +49,14 @@ function showHelp(domainScripts = null) {
     console.log(`DOMAIN SCRIPTS (${domainName}${pathInfo})
 ${domainScripts.scripts.map(s => `  padd ${s.name.padEnd(21)} ${s.description}`).join('\n')}\n`);
   }
-  
+
   console.log(`LIBRARY MODULES
   - SharePointClient     Excel/file operations, uploads
   - ConfluenceClient     Page creation, updates
   - csv-utils            CSV/array conversions
   - refreshProvider      Auto-refresh auth tokens
   - loadAuth             Find & load auth config\n`);
-  
+
   console.log(`Run 'padd <command> --help' for command details`);
   console.log(`Docs: https://github.com/Lukas238/padd\n`);
   process.exit(0);
@@ -70,12 +71,12 @@ function findDomainScripts() {
     // Walk up from CWD looking for package.json with domain field
     let currentDir = process.cwd();
     const root = path.parse(currentDir).root;
-    
+
     while (currentDir !== root) {
       const pkgPath = path.join(currentDir, 'package.json');
       if (fs.existsSync(pkgPath)) {
         const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-        
+
         // Check if this package.json has a domain field
         if (pkg.domain && pkg.scripts) {
           const allScriptNames = Object.keys(pkg.scripts);
@@ -104,22 +105,22 @@ function findDomainScripts() {
               }
               return { name, description };
             });
-          
-          return { 
-            domain: pkg.domain, 
+
+          return {
+            domain: pkg.domain,
             packageName: pkg.name,
-            scripts, 
-            dir: currentDir 
+            scripts,
+            dir: currentDir
           };
         }
       }
-      
+
       currentDir = path.dirname(currentDir);
     }
   } catch (err) {
     // Silently fail - no domain scripts found
   }
-  
+
   return null;
 }
 
@@ -144,7 +145,7 @@ async function main() {
   }
 
   const command = args[0];
-  
+
   // Handle main help for specific commands
   if ((command === '--help' || command === '-h') && args.length === 1) {
     showHelp();
@@ -161,6 +162,12 @@ async function main() {
 
   if (command === 'config') {
     const { run } = await import('./commands/config.js');
+    await run(subArgs);
+    return;
+  }
+
+  if (command === 'confluence') {
+    const { run } = await import('./commands/confluence.js');
     await run(subArgs);
     return;
   }
@@ -197,17 +204,17 @@ async function main() {
   // Try domain script execution
   if (domainScripts && domainScripts.scripts) {
     const scriptExists = domainScripts.scripts.find(s => s.name === command);
-    
+
     if (scriptExists) {
       console.log(`🔧 Running domain script: ${command}\n`);
-      
+
       // Get the actual command from package.json
       const pkg = JSON.parse(fs.readFileSync(path.join(domainScripts.dir, 'package.json'), 'utf8'));
       const scriptCommand = pkg.scripts[command];
-      
+
       // Parse command: "node scripts/feedback-pull.js" -> ["node", "scripts/feedback-pull.js"]
       const [cmd, ...cmdArgs] = scriptCommand.split(/\s+/);
-      
+
       // Resolve script path relative to domain root
       // Important: We resolve to absolute path but don't change CWD
       // This way process.cwd() inside the script = where user ran padd
@@ -219,31 +226,31 @@ async function main() {
         }
         return arg;
       });
-      
+
       // Execute without shell to preserve CWD exactly
       const scriptProcess = spawn(resolvedCmd, [...resolvedArgs, ...subArgs], {
         stdio: ['inherit', 'inherit', 'pipe'], // Capture stderr to clean up error messages
         cwd: process.cwd() // Explicitly maintain current working directory
       });
-      
+
       let stderrOutput = '';
       scriptProcess.stderr.on('data', (data) => {
         stderrOutput += data.toString();
       });
-      
+
       scriptProcess.on('close', (code) => {
         if (code !== 0 && stderrOutput) {
           // Extract just the error message, skip stack trace
           const lines = stderrOutput.split('\n');
           const errorLine = lines.findIndex(line => line.includes('Error:'));
-          
+
           if (errorLine !== -1) {
             // Find where the error message ends (before stack trace)
             let endLine = errorLine + 1;
             while (endLine < lines.length && lines[endLine] && !lines[endLine].trim().startsWith('at ')) {
               endLine++;
             }
-            
+
             // Print only the error message part
             console.error('\n' + lines.slice(errorLine, endLine).join('\n') + '\n');
           } else {
@@ -253,7 +260,7 @@ async function main() {
         }
         process.exit(code || 0);
       });
-      
+
       return;
     }
   }
