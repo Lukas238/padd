@@ -37,5 +37,9 @@
   "dependencies": {
     "node-fetch": "^3.3.2"
   },
+  "scripts": {
+    "test": "node test/run.mjs",
+    "test:update": "node test/run.mjs --update"
+  },
   "devDependencies": {}
 }

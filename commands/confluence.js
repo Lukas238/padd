@@ -27,6 +27,7 @@ import readline from 'readline';
 import { execSync } from 'child_process';
 import { ConfluenceClient } from '../lib/confluence-client.js';
 import { storageToMarkdown, slugifyTitle } from '../lib/confluence-converter.js';
+import { preprocessMarkdown } from '../lib/md-preprocess.js';
 import { getProviderCredentials } from '../lib/auth-storage.js';
 
 // ─── Config Discovery ─────────────────────────────────────────────────────────
@@ -103,13 +104,46 @@ const UNKNOWN_TAGS_FILE = '.confluence-tags.json';
 function readManifest(spaceRoot) {
   const p = path.join(spaceRoot, MANIFEST_FILE);
   if (!fs.existsSync(p)) {
-    // Migrate from old name
     const oldP = path.join(spaceRoot, '.padd-manifest.json');
     if (fs.existsSync(oldP)) fs.renameSync(oldP, p);
-    else return { pages: {} };
+    else return { pages: {}, staged: [], remote: {} };
   }
-  try { return JSON.parse(fs.readFileSync(p, 'utf8')); }
-  catch { return { pages: {} }; }
+  try {
+    const m = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (!m.staged) m.staged = [];
+    if (!m.remote) m.remote = {};
+    if (!m.pages) m.pages = {};
+
+    // Deduplicate: if multiple PageIds share the same localPath, keep the one
+    // whose PageId is found in the actual file on disk. Otherwise keep the entry
+    // with the highest version (most recent push wins).
+    const byPath = {};
+    for (const [id, entry] of Object.entries(m.pages)) {
+      if (!entry.localPath) continue;
+      const existing = byPath[entry.localPath];
+      if (!existing) { byPath[entry.localPath] = id; continue; }
+      // Conflict — check which PageId the file on disk declares
+      const filePath = path.join(spaceRoot, entry.localPath);
+      if (fs.existsSync(filePath)) {
+        const fileId = fs.readFileSync(filePath, 'utf8').match(/<!--\s*PageId:\s*(\d+)\s*-->/)?.[1];
+        if (fileId === id) { byPath[entry.localPath] = id; continue; }
+        if (fileId === existing) continue; // keep existing
+      }
+      // Fall back to higher version
+      if ((entry.version ?? 0) > (m.pages[existing].version ?? 0)) {
+        byPath[entry.localPath] = id;
+      }
+    }
+    const keepIds = new Set(Object.values(byPath));
+    for (const id of Object.keys(m.pages)) {
+      if (m.pages[id].localPath && !keepIds.has(id)) delete m.pages[id];
+    }
+
+    // Deduplicate staged array
+    m.staged = [...new Set(m.staged)];
+
+    return m;
+  } catch { return { pages: {}, staged: [], remote: {} }; }
 }
 
 function writeManifest(spaceRoot, manifest) {
@@ -906,6 +940,9 @@ function buildHeadersForNewFile(raw, filepath, config, manifest) {
 async function runPush(args) {
   const explicitTarget = args.find(a => !a.startsWith('-'));
   const includeChilds = args.includes('--include-childs');
+  const forceHash = args.includes('--force');           // skip hash check, respect staging
+  const cleanOnly = args.includes('--clean');
+  const verbose   = args.includes('--verbose') || args.includes('-v');
   const target = explicitTarget || '.';
 
   const targetPath = path.resolve(target);
@@ -919,6 +956,9 @@ async function runPush(args) {
   const config = findConfluenceConfig(searchDir);
   const debugHtml = !!(config?.debug);
   const spaceRoot = config?._spaceRoot || searchDir;
+
+  // Read manifest early so we can use staged list and avoid double-read
+  const manifest = readManifest(spaceRoot);
 
   // Build file list, optionally including children of a single file target
   let files;
@@ -934,13 +974,26 @@ async function runPush(args) {
     const scanDir = explicitTarget ? targetPath : spaceRoot;
     files = findMdFiles(scanDir);
   }
+
+  // Git-like staging: when no explicit target, restrict to staged files only
+  if (!explicitTarget && !cleanOnly) {
+    const staged = manifest.staged || [];
+    if (staged.length === 0) {
+      console.log('\nNothing staged. Use "padd confluence add <file>" to stage files for push.\n');
+      console.log('  Tip: "padd confluence add ." to stage all modified and new files.\n');
+      return;
+    }
+    const stagedSet = new Set(staged.map(p => path.join(spaceRoot, p)));
+    files = files.filter(f => stagedSet.has(f));
+  }
+
   // Sort shallowest first so parents always push before their children
   files.sort((a, b) => {
     const depthDiff = a.split(path.sep).length - b.split(path.sep).length;
     return depthDiff !== 0 ? depthDiff : a.localeCompare(b);
   });
 
-  if (files.length === 0) {
+  if (files.length === 0 && !cleanOnly) {
     console.error('\n❌ No .md files found.\n');
     process.exit(1);
   }
@@ -966,13 +1019,13 @@ async function runPush(args) {
     markToken  && `-p "${markToken}"`,
   ].filter(Boolean).join(' ');
 
-  const manifest = readManifest(spaceRoot);
   const spaceKey = config?.space;
-  const forceAll  = args.includes('--force');
-  const verbose   = args.includes('--verbose') || args.includes('-v');
 
   let ok = 0, skipped = 0;
-  for (const f of files) {
+  if (cleanOnly) {
+    console.log('\n  --clean: skipping push, running orphan cleanup only.\n');
+  }
+  for (const f of cleanOnly ? [] : files) {
     try {
       let currentFile = f;
       let raw = fs.readFileSync(currentFile, 'utf8');
@@ -980,7 +1033,9 @@ async function runPush(args) {
       // Auto-inject mark headers for new files (no <!-- Space: --> header)
       if (!/<!--\s*Space:\s*/.test(raw)) {
         const { headers, title: injectedTitle } = buildHeadersForNewFile(raw, currentFile, config, manifest);
-        raw = headers + '\n' + raw;
+        // Strip any pre-existing metadata lines to avoid duplication
+        const bodyOnly = raw.replace(/<!--\s*(?:Space|Parent|Title):[^\n]*-->\n?/g, '').replace(/^\n+/, '');
+        raw = headers + '\n' + bodyOnly;
         fs.writeFileSync(currentFile, raw, 'utf8');
         console.log(`  + ${path.relative(spaceRoot, currentFile)}  (new, headers injected)`);
       }
@@ -991,7 +1046,33 @@ async function runPush(args) {
       const pageId      = pageIdMatch?.[1];
       const newTitle    = titleMatch?.[1];
       const manifestEntry = pageId ? manifest.pages?.[pageId] : null;
-      if (!forceAll && manifestEntry?.hash && contentHash(raw) === manifestEntry.hash) {
+      const oldTitle    = manifestEntry?.title;
+      const titleChanged = !!(manifestEntry && newTitle && newTitle !== oldTitle);
+
+      // If only the title changed (or the rename previously failed), rename the local file
+      // now regardless of whether we push — so it's always in sync with the Title comment.
+      if (titleChanged) {
+        const expectedFilename = slugifyTitle(newTitle) + '.md';
+        const expectedFilepath = path.join(path.dirname(currentFile), expectedFilename);
+        if (expectedFilepath !== currentFile && fs.existsSync(currentFile)) {
+          fs.renameSync(currentFile, expectedFilepath);
+          const folderRenamed = renameSlugFolder(path.dirname(expectedFilepath), oldTitle, newTitle);
+          if (folderRenamed) console.log(`  ↻ ${folderRenamed}`);
+          console.log(`  ↻ ${path.basename(currentFile)} → ${expectedFilename}`);
+          currentFile = expectedFilepath;
+          raw = fs.readFileSync(currentFile, 'utf8');
+          if (manifestEntry.localPath) {
+            manifestEntry.localPath = path.join(
+              path.dirname(manifestEntry.localPath), expectedFilename
+            ).replace(/\\/g, '/');
+          }
+          manifestEntry.title = newTitle;
+          writeManifest(spaceRoot, manifest);
+        }
+      }
+
+      // Skip unchanged files — but always push when title changed (Confluence title must stay in sync)
+      if (!forceHash && !titleChanged && manifestEntry?.hash && contentHash(raw) === manifestEntry.hash) {
         skipped++;
         continue;
       }
@@ -1015,17 +1096,29 @@ async function runPush(args) {
         }
       }
 
-      const oldTitle    = manifestEntry?.title;
-      const titleChanged = !!(manifestEntry && newTitle && newTitle !== oldTitle);
-
-      if (titleChanged && spaceKey) {
-        let client;
-        try { client = getClient(config); } catch { /* no credentials available */ }
-        if (client) {
-          const existing = await client.findPageByTitle(spaceKey, newTitle);
+      if (titleChanged && pageId && spaceKey) {
+        let renameClient;
+        try { renameClient = getClient(config); } catch { /* no credentials available */ }
+        if (renameClient) {
+          // Check for title conflict first
+          const existing = await renameClient.findPageByTitle(spaceKey, newTitle);
           if (existing && String(existing.id) !== String(pageId)) {
             console.error(`  ✗ ${path.basename(f)}: title "${newTitle}" is already taken in space ${spaceKey}. Skipping.`);
             continue;
+          }
+          // Rename the page on Confluence BEFORE mark runs, so mark finds it by new title
+          // instead of creating a new page.
+          try {
+            const existingPage = await renameClient.getPage(pageId, 'body.storage,version');
+            await renameClient.updatePage({
+              pageId,
+              title: newTitle,
+              body: existingPage.body?.storage?.value ?? '',
+              version: existingPage.version.number,
+            });
+            console.log(`  ↻ "${oldTitle}" → "${newTitle}" (renamed on Confluence)`);
+          } catch (e) {
+            console.error(`  ⚠ Could not pre-rename page: ${e.message} — mark may create a duplicate.`);
           }
         }
       }
@@ -1046,11 +1139,17 @@ async function runPush(args) {
         );
       }
       // Strip PageId header — it's internal to PADD, mark doesn't understand it.
+      // For existing pages (with PageId), also strip <!-- Parent: --> so mark never
+      // moves a page based on a stale comment. Parent is already set in Confluence.
       // Extract <!--[CONFLUENCE]--> blocks as placeholders so mark receives clean
       // markdown; the real Confluence XML is injected back via API after push.
       const { stripped: _pushStripped, blocks: verbatimBlocks } =
-        extractVerbatimBlocks(convertRelativeMdLinks(bodyForPush, currentFile, spaceRoot));
-      const pushContent = _pushStripped.replace(/<!--\s*PageId:\s*\d+\s*-->\n?/g, '');
+        extractVerbatimBlocks(preprocessMarkdown(convertRelativeMdLinks(bodyForPush, currentFile, spaceRoot)));
+      let pushContent = _pushStripped.replace(/<!--\s*PageId:\s*\d+\s*-->\n?/g, '');
+      if (pageId) {
+        // Existing page — strip Parent to prevent mark from moving it on stale data
+        pushContent = pushContent.replace(/<!--\s*Parent:\s*[^\n]*-->\n?/g, '');
+      }
       const tmpFile = currentFile.replace(/\.md$/, '._padd_push.md');
       fs.writeFileSync(tmpFile, pushContent, 'utf8');
       try {
@@ -1061,6 +1160,12 @@ async function runPush(args) {
       ok++;
       console.log(`  ↑ ${path.relative(spaceRoot, currentFile)}`);
 
+      // Remove from staged after successful push
+      const relPushed = path.relative(spaceRoot, currentFile).replace(/\\/g, '/');
+      if (manifest.staged) {
+        manifest.staged = manifest.staged.filter(p => p !== relPushed);
+      }
+
       // Post-push: restore verbatim Confluence macros via API.
       // mark receives placeholders in the markdown; we replace them with the real
       // <ac:...> XML in the live Confluence storage format after mark has pushed.
@@ -1070,18 +1175,55 @@ async function runPush(args) {
         if (fixClient) {
           try {
             const fixTitle = raw.match(/<!--\s*Title:\s*(.+?)\s*-->/)?.[1] ?? '';
-            const fixPageId = pageId
-              || String((await fixClient.findPageByTitle(spaceKey, fixTitle))?.id ?? '');
+            // Resolve the live PageId — the stored pageId may be stale (e.g. page was
+            // deleted from Confluence and mark recreated it under a different id).
+            let fixPageId = pageId || '';
+            if (fixPageId) {
+              try {
+                await fixClient.getPage(fixPageId, 'version'); // existence check
+              } catch (e) {
+                if (e.message?.includes('404')) {
+                  // Stored PageId is gone — find the page mark just updated by title
+                  const found = await fixClient.findPageByTitle(spaceKey, fixTitle);
+                  if (found) {
+                    fixPageId = String(found.id);
+                    // Self-heal: update file + manifest so future pushes use correct id
+                    const healed = fs.readFileSync(currentFile, 'utf8')
+                      .replace(/<!--\s*PageId:\s*\d+\s*-->/, `<!-- PageId: ${fixPageId} -->`);
+                    fs.writeFileSync(currentFile, healed, 'utf8');
+                    if (manifest.pages[pageId]) {
+                      manifest.pages[fixPageId] = { ...manifest.pages[pageId] };
+                      delete manifest.pages[pageId];
+                    }
+                    console.log(`  ✎ PageId self-healed: ${pageId} → ${fixPageId}`);
+                  } else {
+                    fixPageId = '';
+                  }
+                } else {
+                  throw e;
+                }
+              }
+            }
+            if (!fixPageId) {
+              const found = await fixClient.findPageByTitle(spaceKey, fixTitle);
+              if (found) fixPageId = String(found.id);
+            }
             if (fixPageId) {
               const livePage = await fixClient.getPage(fixPageId, 'body.storage,version');
               let fixedBody = livePage.body?.storage?.value ?? '';
+              let restoredCount = 0;
               for (const { id, xml } of verbatimBlocks) {
                 const esc = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                // mark renders `id` (inline code) as <code>id</code> in Confluence storage
+                // mark renders `id` (inline code) as <code ...>id</code> in Confluence storage
+                // — it may add class attributes, so use <code[^>]*> instead of <code>
                 const before = fixedBody;
-                fixedBody = fixedBody.replace(new RegExp(`<p>\\s*<code>\\s*${esc}\\s*<\\/code>\\s*<\/p>`, 'g'), xml);
-                fixedBody = fixedBody.replace(new RegExp(`<code>\\s*${esc}\\s*<\\/code>`, 'g'), xml);
-                if (fixedBody === before) console.warn(`  ⚠ No match found for placeholder: ${id}`);
+                fixedBody = fixedBody.replace(new RegExp(`<p>\\s*<code[^>]*>\\s*${esc}\\s*<\\/code>\\s*<\/p>`, 'g'), xml);
+                fixedBody = fixedBody.replace(new RegExp(`<code[^>]*>\\s*${esc}\\s*<\\/code>`, 'g'), xml);
+                if (fixedBody !== before) {
+                  restoredCount++;
+                } else {
+                  console.warn(`  ⚠ No match found for placeholder: ${id}`);
+                }
               }
               // Write body to temp file for inspection (deleted on success)
               const debugFile = currentFile.replace(/\.md$/, '._padd_fixbody.html');
@@ -1093,7 +1235,10 @@ async function runPush(args) {
                 version: livePage.version.number,
               });
               if (fs.existsSync(debugFile)) fs.unlinkSync(debugFile);
-              console.log(`  ✎ ${verbatimBlocks.length} Confluence macro(s) restored`);
+              if (restoredCount > 0) console.log(`  ✎ ${restoredCount} Confluence macro(s) restored`);
+              if (restoredCount < verbatimBlocks.length) {
+                console.warn(`  ⚠ ${verbatimBlocks.length - restoredCount} macro(s) could not be matched — check the page manually.`);
+              }
             }
           } catch (e) {
             console.error(`  ⚠ Macro restore failed: ${e.message}`);
@@ -1109,26 +1254,6 @@ async function runPush(args) {
         manifestEntry.hash = contentHash(raw);
       }
 
-      // Post-push: rename file and update manifest if title changed (existing pages)
-      if (titleChanged && newTitle && manifestEntry) {
-        const newFilename = slugifyTitle(newTitle) + '.md';
-        const newFilepath = path.join(path.dirname(currentFile), newFilename);
-        if (newFilepath !== currentFile) {
-          fs.renameSync(currentFile, newFilepath);
-          currentFile = newFilepath;
-          console.log(`  ↻ ${path.basename(f)} → ${newFilename}`);
-        }
-        const folderRenamed = renameSlugFolder(path.dirname(currentFile), oldTitle, newTitle);
-        if (folderRenamed) console.log(`  ↻ ${folderRenamed}`);
-        manifestEntry.title = newTitle;
-        if (manifestEntry.localPath) {
-          manifestEntry.localPath = path.join(
-            path.dirname(manifestEntry.localPath), newFilename
-          ).replace(/\\/g, '/');
-        }
-        writeManifest(spaceRoot, manifest);
-      }
-
       // Post-push: if file had no PageId, find the created/adopted page and write PageId back
       if (!pageId && newTitle && spaceKey) {
         let createClient;
@@ -1140,8 +1265,6 @@ async function runPush(args) {
               const newPageId = String(found.id);
               // Fetch full page with ancestors to derive correct local path
               const fullFound = await createClient.getPage(newPageId, 'version,space,ancestors');
-              const correctRelPath = getPageRelativePath(fullFound, null, false);
-              const correctFilepath = path.join(spaceRoot, correctRelPath);
 
               const fileContent = fs.readFileSync(currentFile, 'utf8');
               const withId = fileContent.replace(
@@ -1149,26 +1272,21 @@ async function runPush(args) {
                 `$1<!-- PageId: ${newPageId} -->\n`
               );
 
-              // Move file to correct location if it differs from current
-              if (path.resolve(correctFilepath) !== path.resolve(currentFile)) {
-                fs.mkdirSync(path.dirname(correctFilepath), { recursive: true });
-                fs.writeFileSync(correctFilepath, withId, 'utf8');
-                fs.unlinkSync(currentFile);
-                console.log(`  ↻ Moved: ${path.relative(spaceRoot, currentFile)} → ${correctRelPath}`);
-                currentFile = correctFilepath;
-              } else {
-                fs.writeFileSync(currentFile, withId, 'utf8');
-              }
+              // For new pages, always write PageId back in place — the user's
+              // chosen filename/path is authoritative. Moving based on Confluence
+              // ancestors breaks parent detection for sibling files still to push.
+              fs.writeFileSync(currentFile, withId, 'utf8');
+              const localPath = path.relative(spaceRoot, currentFile).replace(/\\/g, '/');
 
               manifest.pages[newPageId] = {
                 version: fullFound.version?.number ?? 1,
                 title: newTitle,
-                localPath: correctRelPath,
+                localPath,
                 parentId: getRemoteParentId(fullFound),
                 hash: contentHash(withId),
               };
               writeManifest(spaceRoot, manifest);
-              console.log(`  ✎ [${newPageId}] PageId written → ${correctRelPath}`);
+              console.log(`  ✎ [${newPageId}] PageId written → ${localPath}`);
             }
           } catch { /* non-critical — PageId will be added on next pull */ }
         }
@@ -1216,7 +1334,12 @@ async function runPush(args) {
 
   writeManifest(spaceRoot, manifest);
   const parts = [ok && `${ok} pushed`, skipped && `${skipped} unchanged`].filter(Boolean);
-  console.log(`\n✓ ${parts.join(', ') || 'nothing to push'}.\n`);
+  if (ok === 0 && skipped > 0 && !explicitTarget && !cleanOnly) {
+    console.log(`\n  Everything up to date. ${skipped} staged file(s) unchanged.`);
+    console.log(`  Files remain staged — edit them and push again, or use --force to push anyway.\n`);
+  } else {
+    console.log(`\n✓ ${parts.join(', ') || 'nothing to push'}.\n`);
+  }
 }
 
 // ─── Sync ─────────────────────────────────────────────────────────────────────
@@ -1409,9 +1532,25 @@ padd confluence - Confluence sync (git-like)
 USAGE
   padd confluence init [<space>] [<folder>] [options]
   padd confluence pull [<space>] <page-id> [options]
-  padd confluence push <file.md | directory>
+  padd confluence add  <file|dir|.>
+  padd confluence remove <file|dir|.>
+  padd confluence push [<file|dir>]
+  padd confluence status
+  padd confluence fetch
   padd confluence sync [<space>] <page-id> [options]
   padd confluence sync <directory>
+
+GIT-LIKE WORKFLOW
+  # 1. Edit local files
+  # 2. Stage changes
+  padd confluence add .              # stage all modified + new files
+  padd confluence add home.md        # stage a specific file
+  # 3. Review
+  padd confluence status             # see what's staged, modified, deleted, behind
+  # 4. Push staged files
+  padd confluence push               # push staged files only
+  # 5. Refresh remote version info (no file changes)
+  padd confluence fetch              # update remote versions in manifest
 
 PULL / SYNC OPTIONS
   (no args)           Sync tracked pages: download changed, delete removed
@@ -1425,12 +1564,16 @@ PULL / SYNC OPTIONS
   --flat              All files in space root (no subfolders)
   --rootFolder <dir>  Explicit space root path
 
+PUSH OPTIONS
+  (no args)           Push staged files only (use "add" to stage first)
+  <file|dir>          Push explicit target (bypasses staging)
+  --force             Push staged files ignoring unchanged hash (re-push even if up to date)
+  --clean             Skip push; only delete Confluence pages missing locally
+  --verbose / -v      Show mark output
+
 SPACE ROOT
   The directory where confluence.yml lives IS the space root.
-  Files are written relative to it. Resolution order:
-    1. --rootFolder <path>    → use that path as-is
-    2. confluence.yml found   → its directory is the root
-    3. otherwise              → current directory
+  Files are written relative to it.
 
 CONFLUENCE.YML  (searched upward; child overrides parent)
   server: https://confluence.uhub.biz
@@ -1449,23 +1592,116 @@ EXAMPLES
   padd confluence init WUNARGUA --root-page 928781002
   cd WUNARGUA && padd confluence pull --all
 
-  # Pull a specific subtree
-  cd WUNARGUA && padd confluence pull 928781002 --children
+  # Daily workflow
+  cd WUNARGUA
+  padd confluence pull               # get remote changes
+  # ...edit files...
+  padd confluence add .              # stage all changes
+  padd confluence status             # review
+  padd confluence push               # push staged
 
-  # Update all already-pulled pages (like git pull)
-  cd WUNARGUA && padd confluence pull
-
-  # Push local changes back
-  cd WUNARGUA && padd confluence push ./
-
-  # Full sync
-  cd WUNARGUA && padd confluence sync
+  # Push a specific file immediately (bypasses staging)
+  padd confluence push home.md
 
 NOTES
   - pull: uses confluence.yml or padd auth refresh confluence
   - push: requires mark (brew tap kovetskiy/mark && brew install mark)
   - Each .md includes <!-- PageId --> for unambiguous updates on push
 `);
+}
+
+// ─── Add (staging) ────────────────────────────────────────────────────────────
+
+// ─── Remove (unstage) ─────────────────────────────────────────────────────────
+
+async function runRemove(args) {
+  const searchDir = process.cwd();
+  const config = findConfluenceConfig(searchDir);
+  const spaceRoot = config?._spaceRoot || searchDir;
+  const manifest = readManifest(spaceRoot);
+
+  const targets = args.filter(a => !a.startsWith('-'));
+  if (targets.length === 0) {
+    console.error('\n❌ Usage: padd confluence remove <file|dir|.>\n');
+    process.exit(1);
+  }
+
+  const removed = [];
+  for (const target of targets) {
+    const targetPath = path.resolve(target);
+    let relPaths = [];
+    if (!fs.existsSync(targetPath)) {
+      // Allow removing by relative path even if file is gone
+      const rel = path.relative(spaceRoot, targetPath).replace(/\\/g, '/');
+      relPaths = [rel];
+    } else if (fs.statSync(targetPath).isDirectory()) {
+      relPaths = findMdFiles(targetPath).map(f => path.relative(spaceRoot, f).replace(/\\/g, '/'));
+    } else {
+      relPaths = [path.relative(spaceRoot, targetPath).replace(/\\/g, '/')];
+    }
+
+    for (const rel of relPaths) {
+      if (rel.startsWith('..')) continue;
+      if (manifest.staged.includes(rel)) {
+        manifest.staged = manifest.staged.filter(p => p !== rel);
+        removed.push(rel);
+      }
+    }
+  }
+
+  writeManifest(spaceRoot, manifest);
+  if (removed.length > 0) {
+    console.log(`\n  Unstaged ${removed.length} file(s):\n`);
+    for (const f of removed) console.log(`  - ${f}`);
+    console.log();
+  } else {
+    console.log('\n  Nothing to unstage.\n');
+  }
+}
+
+// ─── Add (staging) ────────────────────────────────────────────────────────────
+
+async function runAdd(args) {
+  const searchDir = process.cwd();
+  const config = findConfluenceConfig(searchDir);
+  const spaceRoot = config?._spaceRoot || searchDir;
+  const manifest = readManifest(spaceRoot);
+
+  const targets = args.filter(a => !a.startsWith('-'));
+  if (targets.length === 0) {
+    console.error('\n❌ Usage: padd confluence add <file|dir|.>\n');
+    process.exit(1);
+  }
+
+  const added = [];
+  for (const target of targets) {
+    const targetPath = path.resolve(target);
+    if (!fs.existsSync(targetPath)) {
+      console.error(`  ✗ Not found: ${target}`);
+      continue;
+    }
+    const files = fs.statSync(targetPath).isDirectory()
+      ? findMdFiles(targetPath)
+      : [targetPath];
+
+    for (const f of files) {
+      const relPath = path.relative(spaceRoot, f).replace(/\\/g, '/');
+      if (relPath.startsWith('..')) continue; // outside space root
+      if (!manifest.staged.includes(relPath)) {
+        manifest.staged.push(relPath);
+        added.push(relPath);
+      }
+    }
+  }
+
+  writeManifest(spaceRoot, manifest);
+  if (added.length > 0) {
+    console.log(`\n  Staged ${added.length} file(s):\n`);
+    for (const f of added) console.log(`  + ${f}`);
+    console.log();
+  } else {
+    console.log('\n  Nothing new to stage.\n');
+  }
 }
 
 // ─── Status ───────────────────────────────────────────────────────────────────
@@ -1481,38 +1717,147 @@ async function runStatus(args) {
   }
 
   const manifest = readManifest(spaceRoot);
-  if (Object.keys(manifest.pages).length === 0) {
-    console.error('❌ Nothing tracked yet. Run: padd confluence pull <page-id>');
-    process.exit(1);
-  }
+  const staged   = new Set(manifest.staged || []);
+  const remote   = manifest.remote || {};
 
-  const modified = [];
-  const missing  = [];
+  // Use Sets to avoid duplicates from manifest entries that share the same localPath
+  const stagedSet   = new Set();
+  const modifiedSet = new Set();
+  const deletedSet  = new Set();
+  const behind      = [];
 
+  const trackedPaths = new Set();
   for (const [id, entry] of Object.entries(manifest.pages)) {
     if (!entry.localPath) continue;
+    // Skip duplicate localPath entries (can happen after Confluence duplicate pages)
+    if (trackedPaths.has(entry.localPath)) continue;
+    trackedPaths.add(entry.localPath);
     const filepath = path.join(spaceRoot, entry.localPath);
+
     if (!fs.existsSync(filepath)) {
-      missing.push(entry.localPath);
-    } else if (entry.hash && contentHash(fs.readFileSync(filepath, 'utf8')) !== entry.hash) {
-      modified.push(entry.localPath);
+      deletedSet.add(entry.localPath);
+      continue;
+    }
+
+    const currentHash = contentHash(fs.readFileSync(filepath, 'utf8'));
+    const isDirty = entry.hash && currentHash !== entry.hash;
+
+    if (staged.has(entry.localPath)) {
+      stagedSet.add(entry.localPath);
+    } else if (isDirty) {
+      modifiedSet.add(entry.localPath);
+    }
+
+    if (remote[id] && remote[id] > (entry.version ?? 0)) {
+      behind.push({ path: entry.localPath, local: entry.version ?? 0, remote: remote[id] });
     }
   }
 
-  if (modified.length === 0 && missing.length === 0) {
-    console.log('Nothing to push.');
+  const newFilesSet = new Set();
+  // Untracked local files (no PageId / not in manifest)
+  for (const f of findMdFiles(spaceRoot)) {
+    const relPath = path.relative(spaceRoot, f).replace(/\\/g, '/');
+    if (trackedPaths.has(relPath)) continue;
+    const content = fs.readFileSync(f, 'utf8');
+    if (/<!--\s*PageId:\s*\d+\s*-->/.test(content)) continue; // has PageId but not in manifest
+    staged.has(relPath) ? stagedSet.add(relPath) : newFilesSet.add(relPath);
+  }
+
+  const stagedList   = [...stagedSet];
+  const modified     = [...modifiedSet];
+  const newFiles     = [...newFilesSet];
+  const deleted      = [...deletedSet];
+
+  const hasAnything = stagedList.length || modified.length || newFiles.length || deleted.length || behind.length;
+  if (!hasAnything) {
+    console.log('\nNothing to push. Working tree clean.\n');
     return;
   }
 
-  if (modified.length > 0) {
-    console.log('Changes not pushed:\n');
-    for (const f of modified) console.log(`  M ${f}`);
+  const G = '\x1b[32m', Y = '\x1b[33m', R = '\x1b[31m', C = '\x1b[36m', Z = '\x1b[0m';
+
+  if (stagedList.length) {
+    console.log('\nChanges staged for push:\n');
+    for (const f of stagedList) console.log(`  ${G}S  ${f}${Z}`);
+    console.log(`\n  (use "padd confluence push" to push)`);
   }
-  if (missing.length > 0) {
-    console.log('\nTracked but missing locally (deleted?):\n');
-    for (const f of missing) console.log(`  D ${f}`);
+  if (modified.length) {
+    console.log('\nChanges not staged:\n');
+    for (const f of modified) console.log(`  ${Y}M  ${f}${Z}`);
+    console.log(`\n  (use "padd confluence add <file>" to stage)`);
   }
-  console.log(`\n  (use "padd confluence push" to push changes)`);
+  if (newFiles.length) {
+    console.log('\nNew files not yet pushed:\n');
+    for (const f of newFiles) console.log(`  ${Y}?  ${f}${Z}`);
+    console.log(`\n  (use "padd confluence add <file>" to stage)`);
+  }
+  if (deleted.length) {
+    console.log('\nDeleted locally:\n');
+    for (const f of deleted) console.log(`  ${R}D  ${f}${Z}`);
+    console.log(`\n  (use "padd confluence push --clean" to remove from Confluence)`);
+  }
+  if (behind.length) {
+    console.log('\nBehind remote (run "padd confluence pull"):\n');
+    for (const b of behind) console.log(`  ${C}↓  ${b.path}  [local v${b.local} / remote v${b.remote}]${Z}`);
+  }
+  console.log();
+}
+
+// ─── Fetch ────────────────────────────────────────────────────────────────────
+
+async function runFetch(args) {
+  const searchDir = process.cwd();
+  const config = findConfluenceConfig(searchDir);
+  if (!config) {
+    console.error('\n❌ No .confluence.yaml found.\n');
+    process.exit(1);
+  }
+  const spaceRoot = config._spaceRoot;
+  const manifest = readManifest(spaceRoot);
+
+  let client;
+  try { client = getClient(config); } catch (e) {
+    console.error(`\n❌ No credentials: ${e.message}\n`);
+    process.exit(1);
+  }
+
+  const pageIds = Object.keys(manifest.pages);
+  if (pageIds.length === 0) {
+    console.error('\n❌ Nothing tracked. Run: padd confluence pull <page-id>\n');
+    process.exit(1);
+  }
+
+  console.log(`\n  Fetching ${pageIds.length} page version(s)...\n`);
+
+  let behind = 0, upToDate = 0, gone = 0;
+  for (const id of pageIds) {
+    try {
+      const page = await client.getPage(id, 'version');
+      const remoteVer  = page.version?.number ?? 0;
+      const localVer   = manifest.pages[id].version ?? 0;
+      manifest.remote[id] = remoteVer;
+      if (remoteVer > localVer) {
+        console.log(`  ↓ ${manifest.pages[id].localPath}  [local v${localVer} → remote v${remoteVer}]`);
+        behind++;
+      } else {
+        upToDate++;
+      }
+    } catch (e) {
+      if (e.message?.includes('404')) {
+        console.log(`  ✗ ${manifest.pages[id].localPath}  (deleted on remote)`);
+        manifest.remote[id] = 0;
+        gone++;
+      }
+    }
+  }
+
+  writeManifest(spaceRoot, manifest);
+  const parts = [
+    behind   && `${behind} behind`,
+    upToDate && `${upToDate} up to date`,
+    gone     && `${gone} gone`,
+  ].filter(Boolean);
+  console.log(`\n✓ ${parts.join(', ')}. Run "padd confluence status" to review.\n`);
 }
 
 // ─── Router ───────────────────────────────────────────────────────────────────
@@ -1531,7 +1876,10 @@ export async function run(args) {
     case 'pull':    await runPull(subArgs);    break;
     case 'push':    await runPush(subArgs);    break;
     case 'sync':    await runSync(subArgs);    break;
+    case 'add':     await runAdd(subArgs);     break;
+    case 'remove':  await runRemove(subArgs);  break;
     case 'status':  await runStatus(subArgs);  break;
+    case 'fetch':   await runFetch(subArgs);   break;
     default:
       console.error(`\n❌ Unknown subcommand: ${subcommand}`);
       console.error(`   Run: padd confluence --help\n`);

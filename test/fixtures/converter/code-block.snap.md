@@ -1,0 +1,12 @@
+<!--[CONFLUENCE]
+<ac:structured-macro ac:name="code" ac:schema-version="1">
+<ac:parameter ac:name="language">javascript</ac:parameter>
+<ac:plain-text-body><![CDATA[const x = 42;
+console.log(x);]]></ac:plain-text-body>
+</ac:structured-macro>
+-->
+```javascript
+const x = 42;
+console.log(x);
+```
+<!--[/CONFLUENCE]-->
