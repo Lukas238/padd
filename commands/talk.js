@@ -1246,9 +1246,10 @@ function inferSeriesTitle(rootDir, seriesKey) {
 function talkTreeFrom(prefix, seriesTitle, year) {
   const safePrefix = sanitizeFileName(prefix);
   const safeTitle = sanitizeFileName(seriesTitle);
-  const rootPage = path.join('confluence', `${safeTitle} - ${safePrefix}.md`);
-  const archivePage = path.join('confluence', `archive - ${safePrefix}.md`);
-  const archiveDir = path.join('confluence', `archive - ${safePrefix}`);
+  const rootBaseName = safeTitle;
+  const rootPage = path.join('confluence', `${safeTitle}.md`);
+  const archivePage = path.join('confluence', rootBaseName, `archive - ${safePrefix}.md`);
+  const archiveDir = path.join('confluence', rootBaseName, `archive - ${safePrefix}`);
   const yearBaseName = `${year} - ${safePrefix}`;
 
   return {
@@ -1657,32 +1658,29 @@ async function initCommand(options) {
     throw new Error('Missing series key. Use --series-key <KEY> (for example WSSC).');
   }
 
-  if (!options.seriesTitle && !options.noPrompt) {
-    const inferredTitle = inferSeriesTitle(rootDir, resolvedSeriesKey);
-    if (!inferredTitle || inferredTitle === 'Talk Series') {
-      const response = await askInteractive('Talk full title (required, e.g. Wanna See Something Cool): ');
-      if (response) {
-        options.seriesTitle = response;
-      }
-    }
+  const inferredTitle = options.seriesTitle || inferSeriesTitle(rootDir, resolvedSeriesKey) || 'Talk Series';
+  if (!options.noPrompt && !options.seriesTitle) {
+    const response = await askInteractive(`Talk full title [${inferredTitle}]: `);
+    options.seriesTitle = response || inferredTitle;
   }
 
-  const seriesTitle = options.seriesTitle || inferSeriesTitle(rootDir, resolvedSeriesKey);
+  const seriesTitle = options.seriesTitle || inferredTitle;
   const tree = talkTreeFrom(resolvedSeriesKey, seriesTitle || 'Talk Series', year);
   const talksCsvPath = path.resolve(rootDir, `talks_${year}.csv`);
   const existingExcelSeed = readExcelMetadataComments(talksCsvPath);
   const existingExcelSharingUrl = legacyExcelSharingUrl || existingExcelSeed.sharingUrl;
   const existingExcelSheetName = legacyExcelSheetName || existingExcelSeed.sheetName;
 
-  if (!options.space && !confluence.space && !options.noPrompt) {
+  if (!isConfiguredValue(options.space) && !isConfiguredValue(confluence.space) && !options.noPrompt) {
     const response = await askInteractive('Confluence space key (optional, enter to skip): ');
     if (response) {
       options.space = response;
     }
   }
 
-  if (!options.parentPageId && !confluence.root_page_id && !options.noPrompt) {
-    const shouldAskParent = Boolean(options.space || confluence.space);
+  const configuredRootPageId = confluence.root_page_id || confluence.root_page || '';
+  if (!isConfiguredValue(options.parentPageId) && !isConfiguredValue(configuredRootPageId) && !options.noPrompt) {
+    const shouldAskParent = Boolean((options.space || confluence.space || '').trim());
     if (shouldAskParent) {
       const response = await askInteractive('Confluence root page id (optional, enter to skip): ');
       if (response) {
@@ -1691,7 +1689,7 @@ async function initCommand(options) {
     }
   }
 
-  if (!options.videoArchiveUrl && !talk.video_archive_url && !options.noPrompt) {
+  if (!isConfiguredValue(options.videoArchiveUrl) && !isConfiguredValue(talk.video_archive_url) && !options.noPrompt) {
     const response = await askInteractive('SharePoint archive root folder URL for videos (optional, enter to skip): ');
     if (response) {
       options.videoArchiveUrl = response;

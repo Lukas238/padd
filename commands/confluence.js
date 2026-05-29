@@ -915,6 +915,30 @@ function findMdFiles(dir) {
 }
 
 /**
+ * Collect ancestor markdown files for a page path, from highest ancestor to nearest parent.
+ * Convention: a folder "foo/" maps to a parent file "foo.md" in its parent directory.
+ */
+function collectAncestorMdDependencies(filePath, spaceRoot) {
+  const deps = [];
+  const resolvedRoot = path.resolve(spaceRoot);
+  let currentDir = path.dirname(path.resolve(filePath));
+
+  while (currentDir !== resolvedRoot && currentDir.startsWith(resolvedRoot)) {
+    const dirName = path.basename(currentDir);
+    const parentDir = path.dirname(currentDir);
+    const candidate = path.join(parentDir, `${dirName}.md`);
+
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+      deps.push(candidate);
+    }
+
+    currentDir = parentDir;
+  }
+
+  return deps.reverse();
+}
+
+/**
  * Extract all <!--[CONFLUENCE]...--> blocks, replacing each with a unique string
  * placeholder. Returns { stripped, blocks: [{placeholder, xml}] }.
  * Handles both verbatim-only blocks and blocks with <!--[/CONFLUENCE]--> closers.
@@ -1053,7 +1077,6 @@ function buildHeadersForNewFile(raw, filepath, config, manifest) {
   }
 
   let headers = `<!-- Space: ${spaceKey} -->\n`;
-  if (rootPageId) headers += `<!-- ParentPageId: ${rootPageId} -->\n`;
   if (parent) headers += `<!-- Parent: ${parent} -->\n`;
   headers += `<!-- Title: ${title} -->\n`;
   return { headers, title };
@@ -1063,6 +1086,7 @@ async function runPush(args) {
   const explicitTarget = args.find(a => !a.startsWith('-'));
   const includeChilds = args.includes('--include-childs');
   const forceHash = args.includes('--force');           // skip hash check, respect staging
+  const forceAll = forceHash;                           // also accept all delete confirmations
   const cleanOnly = args.includes('--clean');
   const verbose   = args.includes('--verbose') || args.includes('-v');
   const target = explicitTarget || '.';
@@ -1097,6 +1121,24 @@ async function runPush(args) {
     files = findMdFiles(scanDir);
   }
 
+  // Dependency expansion: ensure ancestor pages are included before children.
+  // This allows creating missing parent chains automatically in one push.
+  const expandedFiles = [];
+  const seenFiles = new Set();
+  const addFile = (file) => {
+    const abs = path.resolve(file);
+    if (seenFiles.has(abs)) return;
+    seenFiles.add(abs);
+    expandedFiles.push(abs);
+  };
+
+  for (const file of files) {
+    const ancestors = collectAncestorMdDependencies(file, spaceRoot);
+    for (const ancestor of ancestors) addFile(ancestor);
+    addFile(file);
+  }
+  files = expandedFiles;
+
   // Git-like staging: when no explicit target, restrict to staged files only
   if (!explicitTarget && !cleanOnly) {
     const staged = manifest.staged || [];
@@ -1109,11 +1151,66 @@ async function runPush(args) {
     files = files.filter(f => stagedSet.has(f));
   }
 
-  // Sort shallowest first so parents always push before their children
-  files.sort((a, b) => {
+  // Sort parent->child using explicit metadata dependencies first.
+  // This prevents wrong ordering when filenames (e.g. "archive") would otherwise
+  // be sorted before their declared parent titles (e.g. "Dev - ...").
+  const normTitle = (v) => String(v || '').trim().toLowerCase();
+  const baseOrderCompare = (a, b) => {
     const depthDiff = a.split(path.sep).length - b.split(path.sep).length;
     return depthDiff !== 0 ? depthDiff : a.localeCompare(b);
-  });
+  };
+
+  const fileMeta = new Map();
+  const titleToFiles = new Map();
+  for (const f of files) {
+    const raw = fs.readFileSync(f, 'utf8');
+    const title = raw.match(/<!--\s*Title:\s*(.+?)\s*-->/)?.[1]
+      || raw.match(/^(.+)\n={2,}/m)?.[1]
+      || raw.match(/^#\s+(.+)$/m)?.[1]
+      || filenameToTitle(f);
+    const parent = raw.match(/<!--\s*Parent:\s*(.+?)\s*-->/)?.[1] || null;
+    fileMeta.set(f, { title, parent });
+    const key = normTitle(title);
+    if (!titleToFiles.has(key)) titleToFiles.set(key, []);
+    titleToFiles.get(key).push(f);
+  }
+
+  const indegree = new Map(files.map(f => [f, 0]));
+  const children = new Map(files.map(f => [f, []]));
+
+  for (const child of files) {
+    const parentTitle = fileMeta.get(child)?.parent;
+    if (!parentTitle) continue;
+    const candidates = titleToFiles.get(normTitle(parentTitle)) || [];
+    // Only add a local dependency when the parent title resolves uniquely in this batch.
+    if (candidates.length === 1 && candidates[0] !== child) {
+      const parent = candidates[0];
+      children.get(parent).push(child);
+      indegree.set(child, (indegree.get(child) || 0) + 1);
+    }
+  }
+
+  const queue = [...files.filter(f => (indegree.get(f) || 0) === 0)].sort(baseOrderCompare);
+  const ordered = [];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    ordered.push(current);
+    for (const c of children.get(current) || []) {
+      const nextDeg = (indegree.get(c) || 0) - 1;
+      indegree.set(c, nextDeg);
+      if (nextDeg === 0) {
+        queue.push(c);
+        queue.sort(baseOrderCompare);
+      }
+    }
+  }
+
+  if (ordered.length === files.length) {
+    files = ordered;
+  } else {
+    const remaining = files.filter(f => !ordered.includes(f)).sort(baseOrderCompare);
+    files = [...ordered, ...remaining];
+  }
 
   if (files.length === 0 && !cleanOnly) {
     console.error('\n❌ No .md files found.\n');
@@ -1143,14 +1240,65 @@ async function runPush(args) {
 
   const spaceKey = config?.space;
   let parentLookupClient = null;
+  const configuredRootPageId = String(config?.root_page || config?.root_page_id || manifest.rootPage || '').trim() || null;
+  if (configuredRootPageId) manifest.rootPage = configuredRootPageId;
 
-  async function ensureDefaultParentHeadersForNewPage(rawContent) {
-    const hasPageId = /<!--\s*PageId:\s*\d+\s*-->/.test(rawContent);
-    if (hasPageId) return rawContent;
+  const normalizeTitleKey = (v) => String(v || '').trim().toLowerCase();
+  const buildParentTitleKey = (parentId, title) => `${String(parentId || '')}::${normalizeTitleKey(title)}`;
+  let remoteByParentTitle = new Map();
+  let remoteByTitle = new Map();
 
-    const hasParent = /<!--\s*Parent:\s*.+?\s*-->/.test(rawContent);
-    const hasParentPageId = /<!--\s*ParentPageId:\s*\d+\s*-->/.test(rawContent);
-    if (hasParent || hasParentPageId) return rawContent;
+  async function refreshRemoteManifestIndex(reasonLabel) {
+    if (!spaceKey || !configuredRootPageId) return;
+    if (!parentLookupClient) parentLookupClient = getClient(config);
+
+    const remotePages = await parentLookupClient.getSpacePageList(spaceKey, configuredRootPageId);
+    const index = new Map();
+    const byTitle = new Map();
+    const oldRemote = manifest.remote || {};
+    manifest.remote = {};
+
+    for (const page of remotePages) {
+      const id = String(page.id);
+      const parentId = getRemoteParentId(page);
+      const key = buildParentTitleKey(parentId, page.title);
+      const tKey = normalizeTitleKey(page.title);
+
+      const existingId = index.get(key);
+      if (!existingId || (page.version?.number ?? 0) >= (manifest.remote[existingId] ?? 0)) {
+        index.set(key, id);
+      }
+
+      if (!byTitle.has(tKey)) byTitle.set(tKey, []);
+      byTitle.get(tKey).push(id);
+
+      manifest.remote[id] = page.version?.number ?? oldRemote[id] ?? 0;
+
+      if (manifest.pages?.[id]) {
+        manifest.pages[id].title = page.title;
+        manifest.pages[id].parentId = parentId;
+        manifest.pages[id].version = page.version?.number ?? manifest.pages[id].version;
+      }
+    }
+
+    // Tracked pages missing from the remote subtree are marked as gone.
+    for (const trackedId of Object.keys(manifest.pages || {})) {
+      if (!manifest.remote[trackedId]) manifest.remote[trackedId] = 0;
+    }
+
+    remoteByParentTitle = index;
+    remoteByTitle = byTitle;
+    writeManifest(spaceRoot, manifest);
+    if (reasonLabel && verbose) {
+      console.log(`  ○ Manifest remote index refreshed (${reasonLabel}): ${remotePages.length} page(s)`);
+    }
+  }
+
+  // For new pages without an explicit <!-- Parent: --> header, resolve the parent title
+  // dynamically: folder structure first (parent dir .md file), then root_page_id from config.
+  async function ensureParentForNewPage(rawContent) {
+    if (/<!--\s*PageId:\s*\d+\s*-->/.test(rawContent)) return rawContent;
+    if (/<!--\s*Parent:\s*.+?-->/.test(rawContent)) return rawContent;
 
     const rootPageId = String(config?.root_page || config?.root_page_id || manifest.rootPage || '').trim();
     if (!rootPageId) return rawContent;
@@ -1162,22 +1310,96 @@ async function runPush(args) {
         const parentPage = await parentLookupClient.getPage(rootPageId, 'title');
         parentTitle = parentPage?.title || null;
       } catch {
-        // Parent title is optional; ParentPageId is enough to set hierarchy.
+        throw new Error(`Could not resolve root_page_id ${rootPageId}. Check config and credentials.`);
       }
     }
 
-    let insertion = `<!-- ParentPageId: ${rootPageId} -->\n`;
-    if (parentTitle) insertion += `<!-- Parent: ${parentTitle} -->\n`;
+    if (!parentTitle) return rawContent;
 
+    const insertion = `<!-- Parent: ${parentTitle} -->\n`;
     if (/<!--\s*Space:\s*.+?\s*-->/.test(rawContent)) {
       return rawContent.replace(/(<!--\s*Space:\s*.+?\s*-->\n?)/, `$1${insertion}`);
     }
-
-    // If no Space header exists yet, keep existing auto-header injector path untouched.
     return rawContent;
   }
 
+  async function resolveDesiredParentForNewPage(filePath) {
+    const fileDir = path.dirname(path.resolve(filePath));
+    const dirName = path.basename(fileDir);
+    const parentDirMd = path.join(fileDir, '..', dirName + '.md');
+    const isAtSpaceRoot = path.resolve(fileDir) === path.resolve(spaceRoot);
+
+    if (!isAtSpaceRoot && fs.existsSync(parentDirMd)) {
+      const parentContent = fs.readFileSync(parentDirMd, 'utf8');
+      const parentId = parentContent.match(/<!--\s*PageId:\s*(\d+)\s*-->/)?.[1] || null;
+      const parentTitle = parentContent.match(/<!--\s*Title:\s*(.+?)\s*-->/)?.[1]
+        || path.basename(parentDirMd, '.md');
+      return { parentId, parentTitle, parentFile: parentDirMd, source: 'folder' };
+    }
+
+    const rootPageId = String(config?.root_page || config?.root_page_id || manifest.rootPage || '').trim();
+    if (!rootPageId) return { parentId: null, parentTitle: null, parentFile: null, source: 'none' };
+
+    let rootTitle = manifest.pages?.[rootPageId]?.title || null;
+    if (!rootTitle) {
+      try {
+        if (!parentLookupClient) parentLookupClient = getClient(config);
+        const rootPage = await parentLookupClient.getPage(rootPageId, 'title');
+        rootTitle = rootPage?.title || null;
+      } catch {
+        // Keep null; caller handles missing title.
+      }
+    }
+
+    return { parentId: rootPageId, parentTitle: rootTitle, parentFile: null, source: 'root' };
+  }
+
+  function resolveParentIdFromExplicitHeader(rawContent) {
+    const parentTitle = rawContent.match(/<!--\s*Parent:\s*(.+?)\s*-->/)?.[1]?.trim();
+    if (!parentTitle) return { parentId: null, parentTitle: null, source: 'none', ambiguous: false };
+
+    const tKey = normalizeTitleKey(parentTitle);
+
+    const localCandidates = Object.entries(manifest.pages || {})
+      .filter(([, entry]) => normalizeTitleKey(entry?.title) === tKey)
+      .map(([id]) => String(id));
+
+    const remoteCandidates = remoteByTitle.get(tKey) || [];
+    const merged = [...new Set([...localCandidates, ...remoteCandidates])];
+
+    if (merged.length === 1) {
+      const canonicalTitle = manifest.pages?.[merged[0]]?.title || parentTitle;
+      return { parentId: merged[0], parentTitle, canonicalTitle, source: 'explicit', ambiguous: false };
+    }
+    if (merged.length > 1) {
+      return { parentId: null, parentTitle, source: 'explicit', ambiguous: true };
+    }
+
+    // Fuzzy fallback for renamed parents (e.g. "Wanna See ..." -> "Dev - Wanna See ...").
+    const contains = (a, b) => a.includes(b) || b.includes(a);
+    const fuzzyCandidates = Object.entries(manifest.pages || {})
+      .filter(([, entry]) => {
+        const t = normalizeTitleKey(entry?.title);
+        return t && contains(t, tKey);
+      })
+      .map(([id]) => String(id));
+
+    const fuzzyMerged = [...new Set(fuzzyCandidates)];
+    if (fuzzyMerged.length === 1) {
+      const id = fuzzyMerged[0];
+      const canonicalTitle = manifest.pages?.[id]?.title || parentTitle;
+      return { parentId: id, parentTitle, canonicalTitle, source: 'explicit-fuzzy', ambiguous: false };
+    }
+
+    return { parentId: null, parentTitle, canonicalTitle: null, source: 'explicit', ambiguous: false };
+  }
+
   let ok = 0, skipped = 0;
+  try {
+    await refreshRemoteManifestIndex('before push');
+  } catch (e) {
+    console.warn(`  ⚠ Could not refresh remote manifest index before push: ${e.message}`);
+  }
   if (cleanOnly) {
     console.log('\n  --clean: skipping push, running orphan cleanup only.\n');
   }
@@ -1196,21 +1418,74 @@ async function runPush(args) {
         console.log(`  + ${path.relative(spaceRoot, currentFile)}  (new, headers injected)`);
       }
 
-      // New page safety: if parent is not explicit, default to root_page_id.
-      const withDefaultParent = await ensureDefaultParentHeadersForNewPage(raw);
+      // New page safety: if Parent header is missing, resolve from folder structure or root_page_id.
+      const withDefaultParent = await ensureParentForNewPage(raw);
       if (withDefaultParent !== raw) {
         raw = withDefaultParent;
+        fs.writeFileSync(currentFile, raw, 'utf8');
+      }
+
+      const parentCtx = await resolveDesiredParentForNewPage(currentFile);
+      const explicitParent = resolveParentIdFromExplicitHeader(raw);
+
+      if (explicitParent.parentId && explicitParent.canonicalTitle
+          && explicitParent.parentTitle !== explicitParent.canonicalTitle) {
+        raw = raw.replace(
+          /<!--\s*Parent:\s*.+?\s*-->/,
+          `<!-- Parent: ${explicitParent.canonicalTitle} -->`
+        );
+        fs.writeFileSync(currentFile, raw, 'utf8');
+        if (explicitParent.source === 'explicit-fuzzy') {
+          console.log(`  ↻ Parent header normalized: ${explicitParent.parentTitle} → ${explicitParent.canonicalTitle}`);
+        }
+      }
+
+      // Clean up legacy ParentPageId comments — parent is now derived dynamically.
+      if (/<!--\s*ParentPageId:\s*\d+\s*-->/.test(raw)) {
+        raw = raw.replace(/<!--\s*ParentPageId:\s*\d+\s*-->\n?/g, '');
         fs.writeFileSync(currentFile, raw, 'utf8');
       }
 
       // Skip unchanged tracked files (hash matches manifest)
       const pageIdMatch = raw.match(/<!--\s*PageId:\s*(\d+)\s*-->/);
       const titleMatch  = raw.match(/<!--\s*Title:\s*(.+?)\s*-->/);
-      const pageId      = pageIdMatch?.[1];
+      let pageId      = pageIdMatch?.[1];
       const newTitle    = titleMatch?.[1];
-      const manifestEntry = pageId ? manifest.pages?.[pageId] : null;
+      let manifestEntry = pageId ? manifest.pages?.[pageId] : null;
       const oldTitle    = manifestEntry?.title;
-      const titleChanged = !!(manifestEntry && newTitle && newTitle !== oldTitle);
+      let titleChanged = !!(manifestEntry && newTitle && newTitle !== oldTitle);
+
+      // If PageId is not present in the refreshed remote subtree, treat it as stale
+      // and recreate under the desired parent instead of calling mark -l with a 404 id.
+      if (pageId && (manifest.remote?.[pageId] ?? 0) === 0) {
+        console.log(`  ⚠ PageId ${pageId} not found on Confluence subtree. Recreating under expected parent.`);
+        raw = raw.replace(/<!--\s*PageId:\s*\d+\s*-->\n?/g, '');
+        fs.writeFileSync(currentFile, raw, 'utf8');
+        if (manifest.pages?.[pageId]) delete manifest.pages[pageId];
+        pageId = null;
+        manifestEntry = null;
+        titleChanged = false;
+      }
+
+      // If local file has no PageId, adopt only from refreshed manifest index by
+      // (parentId + title). No direct API title search here.
+      if (!pageId && newTitle && spaceKey) {
+        try {
+          const effectiveParentId = explicitParent.parentId || parentCtx.parentId;
+          if (effectiveParentId) {
+            const existingSiblingId = remoteByParentTitle.get(buildParentTitleKey(effectiveParentId, newTitle));
+            if (existingSiblingId) {
+              pageId = String(existingSiblingId);
+              raw = raw.replace(/(<!--\s*Title:[^\n]*\n)/, `$1<!-- PageId: ${pageId} -->\n`);
+              fs.writeFileSync(currentFile, raw, 'utf8');
+              manifestEntry = manifest.pages?.[pageId] || null;
+              console.log(`  ✎ Adopted existing sibling from manifest index: ${newTitle} [${pageId}]`);
+            }
+          }
+        } catch {
+          // Best-effort adoption only.
+        }
+      }
 
       // If only the title changed (or the rename previously failed), rename the local file
       // now regardless of whether we push — so it's always in sync with the Title comment.
@@ -1240,22 +1515,77 @@ async function runPush(args) {
         continue;
       }
 
-      // For new pages (no PageId): validate parent exists in Confluence before pushing
+      // For new pages (no PageId): ensure parent is resolvable.
       if (!pageId) {
-        const fileDir = path.dirname(path.resolve(currentFile));
-        const dirName = path.basename(fileDir);
-        const parentDirMd = path.join(fileDir, '..', dirName + '.md');
-        const isAtSpaceRoot = path.resolve(fileDir) === path.resolve(spaceRoot);
-        if (!isAtSpaceRoot && fs.existsSync(parentDirMd)) {
-          // Re-read parent from disk — it may have just been pushed and had its PageId written
-          const parentContent = fs.readFileSync(parentDirMd, 'utf8');
-          if (!/<!--\s*PageId:\s*\d+\s*-->/.test(parentContent)) {
-            const parentTitle = parentContent.match(/<!--\s*Title:\s*(.+?)\s*-->/)?.[1]
-              || path.basename(parentDirMd, '.md');
-            console.error(`  ✗ ${path.relative(spaceRoot, currentFile)}: parent "${parentTitle}" has no PageId yet.`);
-            console.error(`    Push parent first: padd confluence push ${path.relative(process.cwd(), parentDirMd)}`);
-            continue;
+        if (explicitParent.source === 'explicit' && explicitParent.ambiguous) {
+          console.error(`  ✗ ${path.relative(spaceRoot, currentFile)}: parent "${explicitParent.parentTitle}" is ambiguous in subtree.`);
+          console.error('    Use a unique parent title or update local hierarchy/page IDs first.');
+          continue;
+        }
+        if (explicitParent.source === 'explicit' && !explicitParent.parentId) {
+          console.error(`  ✗ ${path.relative(spaceRoot, currentFile)}: explicit parent "${explicitParent.parentTitle}" was not found in subtree.`);
+          console.error('    Pull to refresh local files or fix the Parent header.');
+          continue;
+        }
+        if (parentCtx.source === 'folder' && !parentCtx.parentId) {
+          console.error(`  ✗ ${path.relative(spaceRoot, currentFile)}: parent "${parentCtx.parentTitle}" has no PageId yet.`);
+          console.error(`    Push parent first: padd confluence push ${path.relative(process.cwd(), parentCtx.parentFile)}`);
+          continue;
+        }
+        if (!(explicitParent.parentId || parentCtx.parentId)) {
+          console.error(`  ✗ ${path.relative(spaceRoot, currentFile)}: no parent could be resolved.`);
+          console.error('    Set confluence.root_page_id in .padd.yaml or add a valid parent file with PageId.');
+          continue;
+        }
+      }
+
+      // For deterministic hierarchy: pre-create new pages under exact parentId,
+      // then push content by page URL (-l) using the resulting PageId.
+      if (!pageId && newTitle && spaceKey) {
+        let createClient;
+        try { createClient = getClient(config); } catch { /* no credentials available */ }
+        if (!createClient) {
+          console.error(`  ✗ ${path.relative(spaceRoot, currentFile)}: cannot create page without Confluence credentials.`);
+          continue;
+        }
+        try {
+          const effectiveParentId = explicitParent.parentId || parentCtx.parentId;
+          const created = await createClient.createPage({
+            spaceKey,
+            title: newTitle,
+            body: '<p></p>',
+            parentId: String(effectiveParentId),
+          });
+          pageId = String(created.id);
+          raw = raw.replace(/(<!--\s*Title:[^\n]*\n)/, `$1<!-- PageId: ${pageId} -->\n`);
+          fs.writeFileSync(currentFile, raw, 'utf8');
+          console.log(`  ✚ Pre-created under parent ${effectiveParentId}: ${newTitle} [${pageId}]`);
+        } catch (e) {
+          const effectiveParentId = explicitParent.parentId || parentCtx.parentId;
+          console.error(`  ✗ ${path.relative(spaceRoot, currentFile)}: could not create page under parent ${effectiveParentId}.`);
+          console.error(`    ${e.message}`);
+          continue;
+        }
+      }
+
+      // Existing page: if explicit Parent resolves to a different parent, move page.
+      if (pageId && explicitParent.parentId && spaceKey) {
+        try {
+          if (!parentLookupClient) parentLookupClient = getClient(config);
+          const livePage = await parentLookupClient.getPage(pageId, 'body.storage,version,ancestors,title');
+          const currentParentId = getRemoteParentId(livePage);
+          if (String(currentParentId || '') !== String(explicitParent.parentId)) {
+            await parentLookupClient.updatePage({
+              pageId,
+              title: livePage.title,
+              body: livePage.body?.storage?.value ?? '',
+              version: livePage.version.number,
+              parentId: String(explicitParent.parentId),
+            });
+            console.log(`  ↻ Re-parented [${pageId}] under ${explicitParent.parentTitle} (${explicitParent.parentId})`);
           }
+        } catch (e) {
+          console.warn(`  ⚠ Could not re-parent [${pageId}] to ${explicitParent.parentTitle}: ${e.message}`);
         }
       }
 
@@ -1263,14 +1593,7 @@ async function runPush(args) {
         let renameClient;
         try { renameClient = getClient(config); } catch { /* no credentials available */ }
         if (renameClient) {
-          // Check for title conflict first
-          const existing = await renameClient.findPageByTitle(spaceKey, newTitle);
-          if (existing && String(existing.id) !== String(pageId)) {
-            console.error(`  ✗ ${path.basename(f)}: title "${newTitle}" is already taken in space ${spaceKey}. Skipping.`);
-            continue;
-          }
-          // Rename the page on Confluence BEFORE mark runs, so mark finds it by new title
-          // instead of creating a new page.
+          // Rename by ID only.
           try {
             const existingPage = await renameClient.getPage(pageId, 'body.storage,version');
             await renameClient.updatePage({
@@ -1309,14 +1632,22 @@ async function runPush(args) {
       const { stripped: _pushStripped, blocks: verbatimBlocks } =
         extractVerbatimBlocks(preprocessMarkdown(convertRelativeMdLinks(bodyForPush, currentFile, spaceRoot)));
       let pushContent = _pushStripped.replace(/<!--\s*PageId:\s*\d+\s*-->\n?/g, '');
-      if (pageId) {
-        // Existing page — strip Parent to prevent mark from moving it on stale data
+      let shouldStripParentHeader = Boolean(pageId);
+      if (shouldStripParentHeader) {
+        // Existing page — strip Parent to prevent mark from moving it on stale data.
         pushContent = pushContent.replace(/<!--\s*Parent:\s*[^\n]*-->\n?/g, '');
       }
+
       const tmpFile = currentFile.replace(/\.md$/, '._padd_push.md');
       fs.writeFileSync(tmpFile, pushContent, 'utf8');
       try {
-        execSync(`mark -f "${tmpFile}" ${markCredFlags}`.trim(), { stdio: verbose ? 'inherit' : 'pipe' });
+        // If we have a pageId and a base URL, use mark -l to target the page directly by URL.
+        // This bypasses title/parent lookup entirely, so the page is always updated in place
+        // regardless of title changes or parent metadata in the file.
+        const markTargetFlag = (pageId && markServer)
+          ? `-l "${markServer}/pages/viewpage.action?pageId=${pageId}"`
+          : '';
+        execSync(`mark -f "${tmpFile}" ${markTargetFlag} ${markCredFlags}`.trim(), { stdio: verbose ? 'inherit' : 'pipe' });
       } finally {
         if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
       }
@@ -1346,30 +1677,14 @@ async function runPush(args) {
                 await fixClient.getPage(fixPageId, 'version'); // existence check
               } catch (e) {
                 if (e.message?.includes('404')) {
-                  // Stored PageId is gone — find the page mark just updated by title
-                  const found = await fixClient.findPageByTitle(spaceKey, fixTitle);
-                  if (found) {
-                    fixPageId = String(found.id);
-                    // Self-heal: update file + manifest so future pushes use correct id
-                    const healed = fs.readFileSync(currentFile, 'utf8')
-                      .replace(/<!--\s*PageId:\s*\d+\s*-->/, `<!-- PageId: ${fixPageId} -->`);
-                    fs.writeFileSync(currentFile, healed, 'utf8');
-                    if (manifest.pages[pageId]) {
-                      manifest.pages[fixPageId] = { ...manifest.pages[pageId] };
-                      delete manifest.pages[pageId];
-                    }
-                    console.log(`  ✎ PageId self-healed: ${pageId} → ${fixPageId}`);
-                  } else {
-                    fixPageId = '';
-                  }
+                  // No title lookup fallback: when PageId is stale, skip macro restore
+                  // and let a subsequent pull repair local state deterministically.
+                  fixPageId = '';
+                  console.warn(`  ⚠ Macro restore skipped: stale PageId ${pageId}. Run "padd confluence pull" to reconcile.`);
                 } else {
                   throw e;
                 }
               }
-            }
-            if (!fixPageId) {
-              const found = await fixClient.findPageByTitle(spaceKey, fixTitle);
-              if (found) fixPageId = String(found.id);
             }
             if (fixPageId) {
               const livePage = await fixClient.getPage(fixPageId, 'body.storage,version');
@@ -1417,46 +1732,37 @@ async function runPush(args) {
         manifestEntry.hash = contentHash(raw);
       }
 
-      // Post-push: if file had no PageId, find the created/adopted page and write PageId back
-      if (!pageId && newTitle && spaceKey) {
-        let createClient;
-        try { createClient = getClient(config); } catch { /* no credentials */ }
-        if (createClient) {
-          try {
-            const found = await createClient.findPageByTitle(spaceKey, newTitle);
-            if (found) {
-              const newPageId = String(found.id);
-              // Fetch full page with ancestors to derive correct local path
-              const fullFound = await createClient.getPage(newPageId, 'version,space,ancestors');
-
-              const fileContent = fs.readFileSync(currentFile, 'utf8');
-              const withId = fileContent.replace(
-                /(<!--\s*Title:[^\n]*\n)/,
-                `$1<!-- PageId: ${newPageId} -->\n`
-              );
-
-              // For new pages, always write PageId back in place — the user's
-              // chosen filename/path is authoritative. Moving based on Confluence
-              // ancestors breaks parent detection for sibling files still to push.
-              fs.writeFileSync(currentFile, withId, 'utf8');
-              const localPath = path.relative(spaceRoot, currentFile).replace(/\\/g, '/');
-
-              manifest.pages[newPageId] = {
-                version: fullFound.version?.number ?? 1,
-                title: newTitle,
-                localPath,
-                parentId: getRemoteParentId(fullFound),
-                hash: contentHash(withId),
-              };
-              writeManifest(spaceRoot, manifest);
-              console.log(`  ✎ [${newPageId}] PageId written → ${localPath}`);
-            }
-          } catch { /* non-critical — PageId will be added on next pull */ }
+      // Track newly created/adopted pages in manifest immediately.
+      if (pageId && !manifestEntry && newTitle && spaceKey) {
+        try {
+          if (!parentLookupClient) parentLookupClient = getClient(config);
+          const fullPage = await parentLookupClient.getPage(pageId, 'version,space,ancestors');
+          const localPath = path.relative(spaceRoot, currentFile).replace(/\\/g, '/');
+          manifest.pages[pageId] = {
+            version: fullPage.version?.number ?? 1,
+            title: newTitle,
+            localPath,
+            parentId: getRemoteParentId(fullPage),
+            hash: contentHash(raw),
+          };
+          writeManifest(spaceRoot, manifest);
+        } catch {
+          // Non-fatal; manifest can be reconciled on next pull.
         }
       }
-    } catch {
+
+    } catch (e) {
       console.error(`  ✗ Failed: ${f}`);
+      if (e?.message) {
+        console.error(`    ${e.message}`);
+      }
     }
+  }
+
+  try {
+    await refreshRemoteManifestIndex('after push');
+  } catch (e) {
+    console.warn(`  ⚠ Could not refresh remote manifest index after push: ${e.message}`);
   }
 
   // Detect locally deleted tracked files
@@ -1739,6 +2045,10 @@ PUSH OPTIONS
   --force             Push staged files ignoring unchanged hash (re-push even if up to date)
   --clean             Skip push; only delete Confluence pages missing locally
   --verbose / -v      Show mark output
+
+PUSH BEHAVIOR
+  - Ancestor chain is auto-included: if you push a child page, PADD pushes parent
+    pages first (oldest ancestor to newest) when matching ancestor .md files exist.
 
 SPACE ROOT
   - Legacy: the directory where .confluence.yaml lives IS the space root.
