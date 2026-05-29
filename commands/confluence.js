@@ -4,13 +4,13 @@
  * padd confluence - Confluence sync commands
  *
  * Commands:
- *   padd confluence init [space] [folder]  → creates confluence.yml
+ *   padd confluence init [space] [folder]  → creates .confluence.yaml
  *   padd confluence pull [space] <page-id> [options]
  *   padd confluence push <file|dir>
  *   padd confluence sync [space] <page-id> [options]
  *
- * The confluence.yml file defines both the space key and the space root.
- * Its location IS the directory where files are downloaded. Searched upward.
+ * Legacy mode: .confluence.yaml defines both the space key and the space root.
+ * New mode: confluence section in .padd.yaml is also supported transparently.
  *
  * confluence.yml:
  *   server: https://confluence.uhub.biz
@@ -29,6 +29,7 @@ import { ConfluenceClient } from '../lib/confluence-client.js';
 import { storageToMarkdown, slugifyTitle } from '../lib/confluence-converter.js';
 import { preprocessMarkdown } from '../lib/md-preprocess.js';
 import { getProviderCredentials } from '../lib/auth-storage.js';
+import { loadCoreConfig } from '../lib/core-config.js';
 
 // ─── Config Discovery ─────────────────────────────────────────────────────────
 
@@ -76,11 +77,62 @@ function findConfluenceConfig(startDir) {
   // Normalize aliases: root_page_id → root_page
   if (merged.root_page_id && !merged.root_page) merged.root_page = merged.root_page_id;
 
+  // Normalize aliases for server/token from .padd.yaml shapes.
+  if (merged.base_url && !merged.server) merged.server = merged.base_url;
+  if (merged.access_token && !merged.token && !merged.pat) merged.pat = merged.access_token;
+  if (merged.token && !merged.pat) merged.pat = merged.token;
+
   // Space root = dir of the closest config that declares a space key
   const spaceConfig = configs.find(c => c.space);
-  merged._spaceRoot = spaceConfig ? spaceConfig._dir : configs[0]._dir;
+  if (spaceConfig) {
+    merged._spaceRoot = spaceConfig._dir;
+  } else if (configs[0]) {
+    merged._spaceRoot = configs[0]._dir;
+  }
 
   return merged;
+}
+
+function loadConfluenceContext(startDir) {
+  const legacy = findConfluenceConfig(startDir);
+
+  let coreConfluence = null;
+  let coreConfigPath = null;
+  try {
+    const core = loadCoreConfig({ startDir, required: false });
+    coreConfluence = core?.config?.confluence || null;
+    coreConfigPath = core?.configPath || null;
+  } catch {
+    // If core config fails, keep legacy behavior.
+  }
+
+  if (!legacy && (!coreConfluence || typeof coreConfluence !== 'object')) {
+    return null;
+  }
+
+  // Precedence: .padd.yaml provides defaults; .confluence.yaml overrides locally.
+  const normalized = {
+    ...(coreConfluence && typeof coreConfluence === 'object' ? coreConfluence : {}),
+    ...(legacy || {}),
+  };
+
+  if (coreConfigPath) {
+    normalized._coreConfigPath = coreConfigPath;
+  }
+
+  if (normalized.root_page_id && !normalized.root_page) normalized.root_page = normalized.root_page_id;
+  if (normalized.base_url && !normalized.server) normalized.server = normalized.base_url;
+  if (normalized.access_token && !normalized.token && !normalized.pat) normalized.pat = normalized.access_token;
+  if (normalized.token && !normalized.pat) normalized.pat = normalized.token;
+
+  // Space root policy:
+  // - If legacy .confluence.yaml exists, it defines the root (backward compatible).
+  // - If only .padd.yaml is used, root is current working/search directory.
+  if (!normalized._spaceRoot) {
+    normalized._spaceRoot = path.resolve(startDir);
+  }
+
+  return normalized;
 }
 
 /**
@@ -94,6 +146,31 @@ function resolveSpaceRoot(rootFolderArg, config) {
   if (rootFolderArg) return path.resolve(rootFolderArg);
   if (config?._spaceRoot) return config._spaceRoot;
   return process.cwd();
+}
+
+function parseBoolean(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'y') return true;
+  if (normalized === 'false' || normalized === '0' || normalized === 'no' || normalized === 'n') return false;
+  return fallback;
+}
+
+function getPullDefaults(config) {
+  const pull = config?.pull || {};
+  return {
+    noParentsDefault: parseBoolean(
+      pull.no_parents_default ?? config?.no_parents_default ?? config?.pull_no_parents_default,
+      false
+    ),
+    autoAllOnEmptyManifest: parseBoolean(
+      pull.auto_all_on_empty_manifest ?? config?.auto_all_on_empty_manifest ?? config?.pull_auto_all_on_empty_manifest,
+      true
+    ),
+    bootstrapPageId:
+      String(pull.bootstrap_page_id ?? config?.bootstrap_page_id ?? config?.pull_bootstrap_page_id ?? '').trim() || null,
+  };
 }
 
 // ─── Manifest ────────────────────────────────────────────────────────────────
@@ -292,7 +369,7 @@ function diffManifest(remotePages, manifest, spaceRoot) {
 
 function getClient(config) {
   const server = config?.server || config?.base_url;
-  const token = config?.token || config?.pat;
+  const token = config?.token || config?.pat || config?.access_token;
 
   if (server && token) {
     return new ConfluenceClient({ baseUrl: server, pat: token, type: 'server' });
@@ -461,7 +538,13 @@ async function runPull(args) {
   const opts = parsePullArgs(args);
 
   const searchDir = opts.rootFolder ? path.resolve(opts.rootFolder) : process.cwd();
-  const config = findConfluenceConfig(searchDir);
+  const config = loadConfluenceContext(searchDir);
+  const pullDefaults = getPullDefaults(config);
+
+  if (!opts.noParents && !opts.flat && pullDefaults.noParentsDefault) {
+    opts.noParents = true;
+  }
+
   const spaceKey = opts.spaceKey || config?.space;
   const spaceRoot = resolveSpaceRoot(opts.rootFolder, config);
   const client = getClient(config);
@@ -473,7 +556,7 @@ async function runPull(args) {
   if (opts.all) {
     const rootPageId = config?.root_page;
     if (!rootPageId) {
-      console.error('\n❌ --all requires root_page in .confluence.yaml');
+      console.error('\n❌ --all requires root_page (or root_page_id) in Confluence config');
       console.error('   Add:  root_page: <space-home-page-id>');
       console.error('   Or:   padd confluence init <space> --root-page <id>\n');
       process.exit(1);
@@ -567,8 +650,46 @@ async function runPull(args) {
 
     if (Object.keys(manifest.pages).length === 0) {
       if (rootPageId) {
-        // No tracked pages but root_page_id is configured — bootstrap with full pull
-        opts.all = true;
+        if (opts.all || pullDefaults.autoAllOnEmptyManifest) {
+          // No tracked pages and auto-all enabled — bootstrap with full pull.
+          // This preserves legacy behavior unless config opts out.
+          opts.all = true;
+        } else {
+          // Safer bootstrap: only bootstrap explicitly configured page.
+          const bootstrapPageId = pullDefaults.bootstrapPageId;
+          if (!bootstrapPageId) {
+            console.error('\n❌ Empty manifest and auto-all bootstrap is disabled.');
+            console.error('   No pages were downloaded.');
+            console.error('   Next step:');
+            console.error('   - pull one page explicitly: padd confluence pull <page-id>');
+            console.error('   - or enable auto bootstrap: confluence.pull.auto_all_on_empty_manifest: true');
+            console.error('   - or set bootstrap page: confluence.pull.bootstrap_page_id: <page-id>\n');
+            process.exit(1);
+          }
+
+          // Start tracking with one explicit page, not whole tree.
+          const page = await client.getPage(bootstrapPageId, 'body.storage,version,space,ancestors');
+
+          await writePageFile(
+            page,
+            spaceRoot,
+            opts.noParents && page.ancestors?.length > 0
+              ? page.ancestors[page.ancestors.length - 1].id
+              : null,
+            !!opts.flat,
+            manifest,
+            baseUrl,
+            debugHtml,
+            tagRecords
+          );
+
+          manifest.space = page.space?.key || resolvedSpace || manifest.space;
+          if (rootPageId) manifest.rootPage = String(rootPageId);
+          writeManifest(spaceRoot, manifest);
+          cleanOrphanFiles(spaceRoot, manifest);
+          console.log('\n✓ 1 page bootstrapped (manifest initialized without full tree pull).\n');
+          return;
+        }
       } else {
         console.error('\n❌ Nothing tracked yet. Run: padd confluence pull <page-id>\n');
         process.exit(1);
@@ -577,7 +698,7 @@ async function runPull(args) {
 
     // Without rootPage we can't do a smart diff — fall back to refetch tracked pages
     if (!rootPageId) {
-      console.warn(`  ⚠  No root_page_id in .confluence.yaml — fetching all tracked pages individually.`);
+      console.warn(`  ⚠  No root_page_id configured — fetching all tracked pages individually.`);
       for (const [id, entry] of Object.entries(manifest.pages)) {
         try {
           const page = await client.getPage(id, 'body.storage,version,space,ancestors');
@@ -926,12 +1047,13 @@ function buildHeadersForNewFile(raw, filepath, config, manifest) {
   }
 
   // Fallback to space root page
+  const rootPageId = config?.root_page || config?.root_page_id || manifest.rootPage || null;
   if (!parent) {
-    const rootPageId = config?.root_page || config?.root_page_id || manifest.rootPage;
     parent = rootPageId ? manifest.pages?.[String(rootPageId)]?.title : null;
   }
 
   let headers = `<!-- Space: ${spaceKey} -->\n`;
+  if (rootPageId) headers += `<!-- ParentPageId: ${rootPageId} -->\n`;
   if (parent) headers += `<!-- Parent: ${parent} -->\n`;
   headers += `<!-- Title: ${title} -->\n`;
   return { headers, title };
@@ -953,7 +1075,7 @@ async function runPush(args) {
 
   const stat = fs.statSync(targetPath);
   const searchDir = stat.isDirectory() ? targetPath : path.dirname(targetPath);
-  const config = findConfluenceConfig(searchDir);
+  const config = loadConfluenceContext(searchDir);
   const debugHtml = !!(config?.debug);
   const spaceRoot = config?._spaceRoot || searchDir;
 
@@ -1020,6 +1142,40 @@ async function runPush(args) {
   ].filter(Boolean).join(' ');
 
   const spaceKey = config?.space;
+  let parentLookupClient = null;
+
+  async function ensureDefaultParentHeadersForNewPage(rawContent) {
+    const hasPageId = /<!--\s*PageId:\s*\d+\s*-->/.test(rawContent);
+    if (hasPageId) return rawContent;
+
+    const hasParent = /<!--\s*Parent:\s*.+?\s*-->/.test(rawContent);
+    const hasParentPageId = /<!--\s*ParentPageId:\s*\d+\s*-->/.test(rawContent);
+    if (hasParent || hasParentPageId) return rawContent;
+
+    const rootPageId = String(config?.root_page || config?.root_page_id || manifest.rootPage || '').trim();
+    if (!rootPageId) return rawContent;
+
+    let parentTitle = manifest.pages?.[rootPageId]?.title || null;
+    if (!parentTitle) {
+      try {
+        if (!parentLookupClient) parentLookupClient = getClient(config);
+        const parentPage = await parentLookupClient.getPage(rootPageId, 'title');
+        parentTitle = parentPage?.title || null;
+      } catch {
+        // Parent title is optional; ParentPageId is enough to set hierarchy.
+      }
+    }
+
+    let insertion = `<!-- ParentPageId: ${rootPageId} -->\n`;
+    if (parentTitle) insertion += `<!-- Parent: ${parentTitle} -->\n`;
+
+    if (/<!--\s*Space:\s*.+?\s*-->/.test(rawContent)) {
+      return rawContent.replace(/(<!--\s*Space:\s*.+?\s*-->\n?)/, `$1${insertion}`);
+    }
+
+    // If no Space header exists yet, keep existing auto-header injector path untouched.
+    return rawContent;
+  }
 
   let ok = 0, skipped = 0;
   if (cleanOnly) {
@@ -1038,6 +1194,13 @@ async function runPush(args) {
         raw = headers + '\n' + bodyOnly;
         fs.writeFileSync(currentFile, raw, 'utf8');
         console.log(`  + ${path.relative(spaceRoot, currentFile)}  (new, headers injected)`);
+      }
+
+      // New page safety: if parent is not explicit, default to root_page_id.
+      const withDefaultParent = await ensureDefaultParentHeadersForNewPage(raw);
+      if (withDefaultParent !== raw) {
+        raw = withDefaultParent;
+        fs.writeFileSync(currentFile, raw, 'utf8');
       }
 
       // Skip unchanged tracked files (hash matches manifest)
@@ -1358,7 +1521,7 @@ async function runSync(args) {
     // sync [page-id] [options] → pull (update tracked or specific page) then push
     const opts = parsePullArgs(args);
     const searchDir = opts.rootFolder ? path.resolve(opts.rootFolder) : process.cwd();
-    const config = findConfluenceConfig(searchDir);
+    const config = loadConfluenceContext(searchDir);
     const spaceRoot = resolveSpaceRoot(opts.rootFolder, config);
 
     console.log('\n📥 Sync 1/2: pull...');
@@ -1564,6 +1727,12 @@ PULL / SYNC OPTIONS
   --flat              All files in space root (no subfolders)
   --rootFolder <dir>  Explicit space root path
 
+DEFAULTS FROM CONFIG (optional)
+  In confluence.pull (inside .padd.yaml):
+  - no_parents_default: true|false
+  - auto_all_on_empty_manifest: true|false
+  - bootstrap_page_id: <page-id>
+
 PUSH OPTIONS
   (no args)           Push staged files only (use "add" to stage first)
   <file|dir>          Push explicit target (bypasses staging)
@@ -1572,13 +1741,22 @@ PUSH OPTIONS
   --verbose / -v      Show mark output
 
 SPACE ROOT
-  The directory where confluence.yml lives IS the space root.
-  Files are written relative to it.
+  - Legacy: the directory where .confluence.yaml lives IS the space root.
+  - .padd.yaml fallback: current working directory is used as the space root.
+  Files are written relative to the resolved root.
 
-CONFLUENCE.YML  (searched upward; child overrides parent)
+CONFLUENCE CONFIG  (searched upward; child overrides parent)
+  Legacy .confluence.yaml:
   server: https://confluence.uhub.biz
   token:  your-PAT          # optional if using padd auth
   space:  WUNARGUA
+
+  Or .padd.yaml (section confluence):
+  confluence:
+    base_url: https://confluence.uhub.biz
+    access_token: your-PAT
+    space: WUNARGUA
+    root_page_id: 123456
 
 INIT OPTIONS
   <space>               Space key — also becomes the folder name
@@ -1616,7 +1794,7 @@ NOTES
 
 async function runRemove(args) {
   const searchDir = process.cwd();
-  const config = findConfluenceConfig(searchDir);
+  const config = loadConfluenceContext(searchDir);
   const spaceRoot = config?._spaceRoot || searchDir;
   const manifest = readManifest(spaceRoot);
 
@@ -1663,7 +1841,7 @@ async function runRemove(args) {
 
 async function runAdd(args) {
   const searchDir = process.cwd();
-  const config = findConfluenceConfig(searchDir);
+  const config = loadConfluenceContext(searchDir);
   const spaceRoot = config?._spaceRoot || searchDir;
   const manifest = readManifest(spaceRoot);
 
@@ -1708,7 +1886,7 @@ async function runAdd(args) {
 
 async function runStatus(args) {
   const searchDir = process.cwd();
-  const config = findConfluenceConfig(searchDir);
+  const config = loadConfluenceContext(searchDir);
   const spaceRoot = config?._spaceRoot || searchDir;
 
   if (!fs.existsSync(spaceRoot)) {
@@ -1807,12 +1985,12 @@ async function runStatus(args) {
 
 async function runFetch(args) {
   const searchDir = process.cwd();
-  const config = findConfluenceConfig(searchDir);
+  const config = loadConfluenceContext(searchDir);
   if (!config) {
-    console.error('\n❌ No .confluence.yaml found.\n');
+    console.error('\n❌ No Confluence config found (.confluence.yaml or .padd.yaml).\n');
     process.exit(1);
   }
-  const spaceRoot = config._spaceRoot;
+  const spaceRoot = config._spaceRoot || searchDir;
   const manifest = readManifest(spaceRoot);
 
   let client;

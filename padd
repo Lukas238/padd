@@ -40,7 +40,9 @@ function showHelp(domainScripts = null) {
   console.log(`CORE COMMANDS
   auth            Manage authentication (init, refresh)
   config          Manage configuration (init, validate)
-  confluence      Pull/push/sync Confluence pages\n`);
+  confluence      Pull/push/sync Confluence pages
+  excel           Pull/push Excel sheets from SharePoint
+  talk            Talk workflow helpers (announcements, video, page)\n`);
 
   if (domainScripts && domainScripts.scripts && domainScripts.scripts.length > 0) {
     const domainPath = path.relative(process.cwd(), domainScripts.dir) || '.';
@@ -168,6 +170,18 @@ async function main() {
 
   if (command === 'confluence') {
     const { run } = await import('./commands/confluence.js');
+    await run(subArgs);
+    return;
+  }
+
+  if (command === 'excel') {
+    const { run } = await import('./commands/excel.js');
+    await run(subArgs);
+    return;
+  }
+
+  if (command === 'talk') {
+    const { run } = await import('./commands/talk.js');
     await run(subArgs);
     return;
   }

@@ -69,3 +69,25 @@ export {
   findTalkConfig,
   getRepoRoot
 } from './lib/config-discovery.js';
+
+// Core YAML Config
+export {
+  DEFAULT_CORE_CONFIG_FILENAMES,
+  findCoreConfigPath,
+  loadCoreConfigFile,
+  loadCoreConfig,
+  getCoreSection,
+  getSharePointAccessToken,
+} from './lib/core-config.js';
+
+// SharePoint Excel Sync
+export {
+  DEFAULT_EXCEL_CONFIG_FILENAMES,
+  resolveExcelSyncConfig,
+  resolveDriveItemFromSharingUrl,
+  pullWorksheetValues,
+  clearWorksheetValues,
+  pushWorksheetValues,
+  pullExcelSheets,
+  pushExcelSheets,
+} from './lib/sharepoint-excel-sync.js';

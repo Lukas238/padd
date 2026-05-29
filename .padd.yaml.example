@@ -1,0 +1,17 @@
+sharepoint:
+  access_token: "eyJ0eXAiOi..."
+  excel:
+    schedule:
+      sharing_url: "https://yourcompany.sharepoint.com/:x:/s/site/..."
+      sheets:
+        Schedule: schedule.csv
+        Topics: topics_backlog.csv
+    feedback:
+      sharing_url: "https://yourcompany.sharepoint.com/:x:/s/site/..."
+      sheets:
+        Sheet1: feedback.csv
+
+confluence:
+  server: "https://confluence.example.com"
+  token: "ATATT..."
+  space: "MYSPACE"

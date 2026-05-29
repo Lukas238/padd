@@ -21,6 +21,9 @@ padd confluence pull --all
 
 # Push a file
 padd confluence push home.md
+
+# Pull Excel sheets from SharePoint
+padd excel pull
 ```
 
 ## Commands
@@ -48,6 +51,96 @@ padd confluence sync              # Pull then push (two-way sync)
 ```bash
 padd config init                  # Initialize config file
 padd config validate              # Validate current config
+```
+
+### Excel Sync (SharePoint)
+
+```bash
+padd excel init                   # Create local .padd.yaml in current folder
+padd excel clone schedule.csv --sheet Schedule --sharing-url "https://..."  # first download
+padd excel pull schedule.csv      # update from remote using CSV metadata
+padd excel push schedule.csv      # push local changes using CSV metadata
+padd excel clone --sheet Schedule --sharing-url "https://..."  # defaults to schedule.csv
+padd excel pull schedule.csv --drive-id "b!..." --item-id "01..."  # metadata override
+```
+
+Preferred config strategy: keep a local config file in the same directory as
+your CSV files (for example `schedule.csv`). PADD will walk ancestor folders
+until it finds one config file.
+
+Create `.padd.yaml`:
+
+```yaml
+sharepoint:
+  access_token: "eyJ0eXAiOi..."
+```
+
+PADD searches upward from the current directory for:
+
+- `.padd.yaml`
+- `.padd.yml`
+- `padd.yaml`
+- `padd.yml`
+- `config.talk.json` (backward-compatible fallback)
+
+Notes:
+- Core settings are namespaced by parent keys (`sharepoint`, `confluence`) to avoid token mixups.
+- Excel sync does not refresh tokens automatically. If token is expired, command fails and you refresh manually.
+- URL/sheet mapping is file-by-file via CSV comments (FastCSV-style `#`) and CLI flags, not config.
+- Preferred critical metadata per CSV: BrowserURL, Workbook, Sheet, DriveId, ItemId.
+
+Workflow model:
+- `clone` = first download for a specific file/sheet pair
+- `pull <file>` = refresh that same file from remote
+- `push <file>` = publish local edits for that file
+
+### Talk Workflow
+
+```bash
+padd talk init --space WUNARGCAPABILITY --parent-page-id 123456 --series-title "WSSC Talks" --series-key WSSC
+padd talk new --talk 7
+padd talk new --date 2026-05-28
+padd talk video --talk 7 --video-url "https://..."
+padd talk page --talk 7
+padd talk page --date 2026-05-28
+```
+
+Optional `.padd.yaml` section for talks:
+
+```yaml
+talk:
+  prefix: WSSC
+confluence:
+  talk:
+    space: WUNARGCAPABILITY
+    parent_page_id: "123456"
+```
+
+Talk flow model:
+- `init` = set/update `.padd.yaml` + create local root/archive/year pages + store SharePoint archive URL only
+- `new` = generate temporary announcements for personal comms (uses `announcements.tmpl.md` at config root if present, otherwise generic fallback)
+- `video` = update processed video URL in `schedule.csv` and, when possible, resolve/cache SharePoint archive IDs from the saved folder URL
+- `page` = upsert local talk page in `confluence/archive - <PREFIX>/<YEAR - PREFIX>/` from `talks.csv` (uses `page.tmpl.md` if present, otherwise generic fallback)
+- `announcements` remains as alias of `new`
+- `create` and `publish` remain as deprecated aliases to `page`
+
+Conventions:
+- Talks source file defaults to `talks.csv` at the same root directory where `.padd.yaml` lives.
+- Confluence markdown tree is always created under `confluence/` to avoid mixing with operational files in root.
+- `init` creates `talks.csv` if missing (copies `schedule.csv` if present, otherwise writes headers).
+
+CSV comment example:
+
+```text
+sharepoint:
+  talk:
+    video_archive:
+      share_url: "https://wppcloud.sharepoint.com/:f:/s/..."
+# BrowserURL: https://wppcloud.sharepoint.com/...
+# Workbook: Dev Talks - Wanna See Something Cool_.xlsx
+# Sheet: Schedule
+# DriveId: b!ABC...
+# ItemId: 01XYZ...
 ```
 
 ## Confluence Sync
